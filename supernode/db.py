@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import (
     Boolean,
@@ -85,8 +86,8 @@ class RegistrationSession(Base):
     challenge_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     challenge_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     challenge_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    email_code_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    email_code_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    email_code_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    email_code_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     email_code_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)

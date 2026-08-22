@@ -18,6 +18,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
 
 RAW_PRIVATE_KEY_LEN = 32  # bytes
 RAW_PUBLIC_KEY_LEN = 32  # bytes
@@ -36,10 +42,26 @@ def generate_keypair() -> tuple[str, str]:
 
     private_key_hex 是 32 字节原始私钥材料（不是 64 字节的
     签名用种子扩展形式），与文档约定一致。
+
+    兼容 cryptography >= 36.0.1（无 *_raw 方法）。
     """
     private_key = Ed25519PrivateKey.generate()
-    priv = private_key.private_bytes_raw()
-    pub = private_key.public_key().public_bytes_raw()
+    # cryptography >= 41 有 *_raw()；旧版本用 private_bytes/public_bytes
+    try:
+        priv = private_key.private_bytes_raw()
+    except AttributeError:
+        priv = private_key.private_bytes(
+            encoding=Encoding.Raw,
+            format=PrivateFormat.Raw,
+            encryption_algorithm=NoEncryption(),
+        )
+    try:
+        pub = private_key.public_key().public_bytes_raw()
+    except AttributeError:
+        pub = private_key.public_key().public_bytes(
+            encoding=Encoding.Raw,
+            format=PublicFormat.Raw,
+        )
     return priv.hex(), pub.hex()
 
 

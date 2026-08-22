@@ -56,7 +56,11 @@ def _send_console(to_email: str, code: str) -> EmailResult:
 
 
 def _send_smtp(settings, to_email: str, code: str) -> EmailResult:
-    """生产模式：SMTP 发送。"""
+    """生产模式：SMTP 发送。
+
+    端口 465 → SMTP_SSL（直接 TLS 包裹）
+    端口 587 → SMTP + STARTTLS
+    """
     subject = "SuperNode 注册验证码"
     body = f"您的 SuperNode 注册验证码：\n\n{code}\n\n验证码 {settings.email_code_ttl // 60} 分钟内有效，请勿泄露给他人。"
     msg = MIMEText(body, "plain", "utf-8")
@@ -65,10 +69,17 @@ def _send_smtp(settings, to_email: str, code: str) -> EmailResult:
     msg["To"] = to_email
 
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as server:
-            server.starttls()
-            server.login(settings.smtp_user, settings.smtp_password)
-            server.sendmail(settings.email_from, [to_email], msg.as_string())
+        if settings.smtp_port == 465:
+            # SMTP over SSL（Gmail 465 用这种）
+            with smtplib.SMTP_SSL(settings.smtp_host, 465, timeout=15) as server:
+                server.login(settings.smtp_user, settings.smtp_password)
+                server.sendmail(settings.email_from, [to_email], msg.as_string())
+        else:
+            # SMTP + STARTTLS（标准 587）
+            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as server:
+                server.starttls()
+                server.login(settings.smtp_user, settings.smtp_password)
+                server.sendmail(settings.email_from, [to_email], msg.as_string())
         return EmailResult(ok=True, code=code)
     except Exception as e:
         logger.error("SMTP 发送失败: %s", e)
