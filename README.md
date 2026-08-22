@@ -25,7 +25,34 @@ python -m supernode.main
 
 - API 文档：http://127.0.0.1:8000/docs
 - 健康检查：http://127.0.0.1:8000/api/health
-- 开发模式邮件验证码打印到服务端 stdout
+- 默认邮件后端为 `console`（验证码打印到服务端终端，不实际发信）
+
+### 邮件配置
+
+SuperNode 通过环境变量或 `.env` 文件配置邮件服务，**仓库中不包含任何真实凭据**。
+
+```bash
+# 1. 复制模板
+cp .env.example .env
+
+# 2. 编辑 .env 填入 SMTP 信息（.env 已在 .gitignore 中排除）
+#    SUPERNODE_EMAIL_BACKEND=smtp
+#    SUPERNODE_SMTP_HOST=smtp.gmail.com
+#    SUPERNODE_SMTP_PORT=465
+#    SUPERNODE_SMTP_USER=your@gmail.com
+#    SUPERNODE_SMTP_PASSWORD=your-app-password
+#    SUPERNODE_EMAIL_FROM=your@gmail.com
+```
+
+两种模式：
+
+| 模式 | `SUPERNODE_EMAIL_BACKEND` | 用途 |
+|---|---|---|
+| 开发 | `console`（默认） | 验证码打印到终端，方便调试 |
+| 生产 | `smtp` | 通过 SMTP 发送真实邮件 |
+
+> ⚠️ **安全提醒**：`.env` 文件包含 SMTP 凭据，已被 `.gitignore` 排除，
+> 切勿提交到版本库或分享给他人。
 
 ### 运行测试
 
@@ -102,7 +129,7 @@ GET /api/me              # 需要 Bearer token
 ```
 supernode/
 ├── __init__.py
-├── config.py      # 配置
+├── config.py      # 配置（支持 .env 文件）
 ├── crypto.py      # Ed25519 密码学工具
 ├── db.py          # SQLAlchemy 数据模型
 ├── email.py       # 邮件服务
@@ -112,6 +139,8 @@ tests/
 ├── test_crypto.py # Phase 1: 密码学验证
 └── test_e2e.py    # Phase 2-5: 端到端测试
 client_example.py  # 客户端示例
+.env.example       # 环境变量模板（可提交）
+.env               # 本地凭据（已 gitignore，勿提交）
 ```
 
 ## 技术栈

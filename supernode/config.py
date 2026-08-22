@@ -1,12 +1,32 @@
 """SuperNode 配置。
 
-开发环境默认值即可运行；生产环境通过环境变量覆盖。
+开发环境默认值即可运行；生产环境通过环境变量或 .env 文件覆盖。
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _load_env_file():
+    """加载项目根目录的 .env 文件（如果存在）。
+
+    不依赖 python-dotenv，简单的 KEY=VALUE 解析。
+    已存在的环境变量不会被覆盖。
+    """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 @dataclass
@@ -52,5 +72,6 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    """构造配置实例。"""
+    """构造配置实例。自动加载 .env 文件（如果存在）。"""
+    _load_env_file()
     return Settings()
