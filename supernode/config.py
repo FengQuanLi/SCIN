@@ -60,6 +60,14 @@ class Settings:
     # 节点内容
     node_content_max_length: int = 10000    # 单条信息最大字符数
 
+    # 速率限制（IP 级，滑动窗口）
+    rl_auth_challenge: tuple[int, int] = (10, 60)       # 10 次/分钟
+    rl_register_start: tuple[int, int] = (5, 3600)      # 5 次/小时
+    rl_publish: tuple[int, int] = (60, 3600)            # 60 次/小时
+
+    # 过期数据清理
+    cleanup_interval_hours: int = 6                   # 每 6 小时清理一次过期记录
+
     # 邮箱服务
     # 开发模式: "console"（打印到日志，不实际发信）
     # 生产模式: "smtp"（需要配置 SMTP 相关项）

@@ -40,6 +40,10 @@ def client():
 @pytest.fixture()
 def patched_client(monkeypatch):
     """可预测验证码的测试客户端。"""
+    # 重置速率限制器，避免跨测试状态泄漏
+    from supernode.ratelimit import get_limiter
+    get_limiter()._hits.clear()
+
     captured_codes = {}
 
     def fake_send(settings, to_email, code):
@@ -303,6 +307,93 @@ class TestMe:
         c, _, _ = patched_client
         r = c.get("/api/me")
         assert r.status_code == 401
+
+
+class TestRotateKey:
+    def test_rotate_key(self, patched_client):
+        user_id, priv, pub = do_register(patched_client, email="rotate@test.com")
+        token = do_auth(patched_client, user_id, priv)
+        c, _, _ = patched_client
+
+        # 生成新密钥对
+        new_priv, new_pub = crypto.generate_keypair()
+
+        # 用旧私钥签名 "rotate-key:{new_pub}"
+        message = f"rotate-key:{new_pub}".encode()
+        sig = crypto.sign_hex(priv, message)
+
+        r = c.post("/api/me/rotate-key", json={
+            "new_public_key": new_pub,
+            "signature": sig,
+        }, headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True
+        assert data["public_key"] == new_pub
+
+        # 验证旧公钥已替换
+        r = c.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.json()["public_key"] == new_pub
+
+        # 用新密钥认证
+        new_token = do_auth(patched_client, user_id, new_priv)
+        assert len(new_token) == 64
+
+    def test_rotate_key_bad_signature(self, patched_client):
+        user_id, priv, pub = do_register(patched_client, email="rotatebad@test.com")
+        token = do_auth(patched_client, user_id, priv)
+        c, _, _ = patched_client
+
+        new_priv, new_pub = crypto.generate_keypair()
+        # 用错误的私钥签名
+        other_priv, _ = crypto.generate_keypair()
+        message = f"rotate-key:{new_pub}".encode()
+        sig = crypto.sign_hex(other_priv, message)
+
+        r = c.post("/api/me/rotate-key", json={
+            "new_public_key": new_pub,
+            "signature": sig,
+        }, headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 401
+
+    def test_rotate_key_requires_auth(self, patched_client):
+        c, _, _ = patched_client
+        _, new_pub = crypto.generate_keypair()
+        r = c.post("/api/me/rotate-key", json={
+            "new_public_key": new_pub,
+            "signature": "aa" * 64,
+        })
+        assert r.status_code == 401
+
+
+class TestRateLimit:
+    def test_auth_challenge_rate_limit(self, patched_client):
+        """超过 10 次/分钟应返回 429。"""
+        user_id, priv, _ = do_register(patched_client, email="rl@test.com")
+        c, _, _ = patched_client
+
+        # 前 10 次应成功
+        for i in range(10):
+            r = c.post("/api/auth/challenge", json={"user_id": user_id})
+            assert r.status_code == 200, f"第 {i+1} 次应成功: {r.text}"
+
+        # 第 11 次应被限流
+        r = c.post("/api/auth/challenge", json={"user_id": user_id})
+        assert r.status_code == 429
+
+    def test_register_rate_limit(self, patched_client):
+        """超过 5 次/小时应返回 429。"""
+        c, _, _ = patched_client
+        priv, pub = crypto.generate_keypair()
+
+        for i in range(5):
+            email = f"rl{i}@test.com"
+            r = c.post("/api/register/start", json={"email": email, "public_key": pub})
+            assert r.status_code == 200, f"第 {i+1} 次应成功: {r.text}"
+
+        # 第 6 次应被限流
+        r = c.post("/api/register/start", json={"email": "rl5@test.com", "public_key": pub})
+        assert r.status_code == 429
 
 
 class TestHealth:

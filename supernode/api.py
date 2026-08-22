@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from . import crypto, email as email_svc
 from .config import Settings
+from .ratelimit import RateLimit, get_limiter
 from .db import (
     AccessToken,
     AuthChallenge,
@@ -47,6 +48,18 @@ from .db import (
 logger = logging.getLogger("supernode.api")
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def _mask_email(email: str) -> str:
+    """邮箱脱敏: a***@b.com"""
+    if "@" not in email:
+        return "***"
+    local, domain = email.rsplit("@", 1)
+    if len(local) <= 2:
+        masked_local = local[0] + "*" * (len(local) - 1)
+    else:
+        masked_local = local[:2] + "*" * (len(local) - 2)
+    return f"{masked_local}@{domain}"
 
 # ── 依赖注入 ────────────────────────────────────────────────────────────────
 
@@ -128,6 +141,11 @@ class NodeCreateReq(BaseModel):
     content: str = Field(..., min_length=1)
 
 
+class RotateKeyReq(BaseModel):
+    new_public_key: str
+    signature: str  # 旧私钥对 "rotate-key:{new_public_key}" 的 Ed25519 签名
+
+
 class NodeOut(BaseModel):
     id: int
     content: str
@@ -177,6 +195,22 @@ def _token_to_user(db: Session, token: str) -> User:
     return user
 
 
+def _client_ip(request: Request) -> str:
+    """获取客户端真实 IP（支持 Nginx 反向代理）。"""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limit_check(request: Request, name: str, limit: tuple[int, int]):
+    """IP 级速率限制。"""
+    limiter = get_limiter()
+    key = f"{name}:{_client_ip(request)}"
+    if not limiter.check(key, RateLimit(max_requests=limit[0], window_seconds=limit[1])):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
+
 # ── 应用工厂 ──────────────────────────────────────────────────────────────
 
 
@@ -202,11 +236,49 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
 
+    # ── 后台清理过期数据 ─────────────────────────────────────────────────
+
+    import threading
+    import time as _time
+
+    def _cleanup_loop():
+        """定时清理过期数据。"""
+        from sqlalchemy import delete as sql_delete
+        while True:
+            _time.sleep(_settings.cleanup_interval_hours * 3600)
+            try:
+                db = _SFactory()
+                now = utcnow()
+                count_reg = db.execute(
+                    sql_delete(RegistrationSession).where(RegistrationSession.challenge_expires_at < now)
+                ).rowcount
+                count_auth = db.execute(
+                    sql_delete(AuthChallenge).where(AuthChallenge.expires_at < now)
+                ).rowcount
+                count_token = db.execute(
+                    sql_delete(AccessToken).where(AccessToken.expires_at < now)
+                ).rowcount
+                db.commit()
+                if count_reg or count_auth or count_token:
+                    logger.info(
+                        "清理过期数据: registration_sessions=%d, auth_challenges=%d, access_tokens=%d",
+                        count_reg, count_auth, count_token,
+                    )
+                db.close()
+            except Exception as e:
+                logger.error("清理过期数据失败: %s", e)
+
+    _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
+    _cleanup_thread.start()
+
     # ── 注册 ────────────────────────────────────────────────────────────
 
     @app.post("/api/register/start", response_model=RegisterStartResp)
-    def register_start(req: RegisterStartReq, db: Session = Depends(_get_db)):
+    def register_start(req: RegisterStartReq, request: Request, db: Session = Depends(_get_db)):
         """注册开始：提交邮箱 + 公钥，服务器返回 registration_id 和 challenge。"""
+        # 0. 速率限制
+        _rate_limit_check(request, "register", _settings.rl_register_start)
+
         # 1. 验证邮箱格式
         if not EMAIL_RE.match(req.email):
             raise HTTPException(status_code=400, detail="邮箱格式无效")
@@ -247,7 +319,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session.email_code_attempts = 0
         db.commit()
 
-        logger.info("注册开始: email=%s reg_id=%s", req.email, registration_id)
+        logger.info("注册开始: email=%s reg_id=%s", _mask_email(req.email), registration_id)
         return RegisterStartResp(registration_id=registration_id, challenge=challenge)
 
     @app.post("/api/register/proof", response_model=RegisterProofResp)
@@ -271,7 +343,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session.challenge_verified = True
         db.commit()
 
-        logger.info("注册签名验证通过: email=%s", session.email)
+        logger.info("注册签名验证通过: email=%s", _mask_email(session.email))
         return RegisterProofResp(ok=True, message="签名验证通过")
 
     @app.post("/api/register/verify-email", response_model=RegisterVerifyEmailResp)
@@ -327,14 +399,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.delete(session)
         db.commit()
 
-        logger.info("注册完成: user_id=%d email=%s", user.id, user.email)
+        logger.info("注册完成: user_id=%d email=%s", user.id, _mask_email(user.email))
         return RegisterVerifyEmailResp(ok=True, user_id=user.id, message="注册成功")
 
     # ── 认证 ────────────────────────────────────────────────────────────
 
     @app.post("/api/auth/challenge", response_model=AuthChallengeResp)
-    def auth_challenge(req: AuthChallengeReq, db: Session = Depends(_get_db)):
+    def auth_challenge(req: AuthChallengeReq, request: Request, db: Session = Depends(_get_db)):
         """请求认证 challenge。"""
+        _rate_limit_check(request, "auth", _settings.rl_auth_challenge)
         user = db.get(User, req.user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
@@ -441,6 +514,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         user = _token_to_user(db, token)
 
+        # 速率限制（按用户 IP）
+        _rate_limit_check(request, "publish", _settings.rl_publish)
+
         if len(req.content) > _settings.node_content_max_length:
             raise HTTPException(
                 status_code=400,
@@ -482,6 +558,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "email_verified": user.email_verified,
             "created_at": user.created_at.isoformat(),
         }
+
+    @app.post("/api/me/rotate-key")
+    def rotate_key(req: RotateKeyReq, request: Request, db: Session = Depends(_get_db)):
+        """公钥轮换：用旧私钥签名新公钥，替换存储的公钥。
+
+        User ID 和历史数据 (nodes) 保持不变。
+        签名对象 = "rotate-key:{new_public_key}" 的 UTF-8 字节。
+        """
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <token>")
+        user = _token_to_user(db, token)
+
+        if not crypto.is_valid_public_key_hex(req.new_public_key):
+            raise HTTPException(status_code=400, detail="新公钥格式无效")
+
+        # 验证旧私钥对新公钥的签名
+        message = f"rotate-key:{req.new_public_key}".encode()
+        ok = crypto.verify_hex(user.public_key, message, req.signature)
+        if not ok:
+            raise HTTPException(status_code=401, detail="旧私钥签名验证失败")
+
+        user.public_key = req.new_public_key
+        user.updated_at = utcnow()
+        db.commit()
+
+        logger.info("公钥轮换: user_id=%d", user.id)
+        return {"ok": True, "user_id": user.id, "public_key": user.public_key}
 
     @app.get("/api/health")
     def health():
@@ -578,11 +682,25 @@ GET /api/me
   请求头: Authorization: Bearer <token>
   返回: {user_id, email, public_key, account_mode, email_verified, created_at}
 
+POST /api/me/rotate-key
+  公钥轮换 (User ID 和历史数据不变)
+  请求头: Authorization: Bearer <token>
+  请求: {"new_public_key": "<64 hex>", "signature": "<128 hex>"}
+  说明: signature = 旧私钥对 "rotate-key:{new_public_key}" 的 UTF-8 字节的 Ed25519 签名
+  返回: {"ok": true, "user_id": 1, "public_key": "<新公钥>"}
+
 [其他]
 
 GET /api/health
   健康检查
   返回: {"status": "ok", "version": "0.1.0"}
+
+速率限制 (IP 级, 滑动窗口)
+--------------------------
+POST /api/auth/challenge    10 次/分钟
+POST /api/register/start    5 次/小时
+POST /api/nodes             60 次/小时
+超出限制返回 HTTP 429
 
 错误格式
 --------
@@ -592,7 +710,7 @@ HTTP 404  资源不存在
 HTTP 409  邮箱已注册
 HTTP 410  challenge 已过期或已使用
 HTTP 412  前置条件未满足 (如未先提交 proof)
-HTTP 429  验证码尝试次数过多
+HTTP 429  请求过于频繁 / 验证码尝试次数过多
 HTTP 502  邮件发送失败
 """
 
