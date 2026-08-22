@@ -64,6 +64,7 @@ class Settings:
     rl_auth_challenge: tuple[int, int] = (10, 60)       # 10 次/分钟
     rl_register_start: tuple[int, int] = (5, 3600)      # 5 次/小时
     rl_publish: tuple[int, int] = (60, 3600)            # 60 次/小时
+    rl_recover: tuple[int, int] = (3, 3600)             # 恢复 3 次/小时
 
     # 过期数据清理
     cleanup_interval_hours: int = 6                   # 每 6 小时清理一次过期记录

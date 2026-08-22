@@ -34,6 +34,7 @@ from .db import (
     AuthChallenge,
     Base,
     Node,
+    RecoverySession,
     RegistrationSession,
     User,
     create_db_engine,
@@ -144,6 +145,26 @@ class NodeCreateReq(BaseModel):
 class RotateKeyReq(BaseModel):
     new_public_key: str
     signature: str  # 旧私钥对 "rotate-key:{new_public_key}" 的 Ed25519 签名
+
+
+class RecoverStartReq(BaseModel):
+    user_id: int
+    new_public_key: str
+
+
+class RecoverStartResp(BaseModel):
+    recovery_id: str
+
+
+class RecoverConfirmReq(BaseModel):
+    recovery_id: str
+    code: str
+
+
+class RecoverConfirmResp(BaseModel):
+    ok: bool
+    user_id: int | None = None
+    message: str = ""
 
 
 class NodeOut(BaseModel):
@@ -587,6 +608,108 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         logger.info("公钥轮换: user_id=%d", user.id)
         return {"ok": True, "user_id": user.id, "public_key": user.public_key}
 
+    # ── 账户恢复（私钥丢失）─────────────────────────────────────────────
+
+    @app.post("/api/auth/recover/start", response_model=RecoverStartResp)
+    def recover_start(req: RecoverStartReq, request: Request, db: Session = Depends(_get_db)):
+        """私钥丢失恢复 — 第一步：提交 user_id + 新公钥，服务器发邮箱验证码。
+
+        适用场景: 私钥彻底丢失，无法签名，只能通过邮箱找回。
+        前提: 账户模式为 recoverable。
+        """
+        _rate_limit_check(request, "recover", _settings.rl_recover)
+
+        user = db.get(User, req.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        if user.account_mode != "recoverable":
+            raise HTTPException(status_code=403, detail="该账户不支持邮箱恢复")
+
+        if not crypto.is_valid_public_key_hex(req.new_public_key):
+            raise HTTPException(status_code=400, detail="新公钥格式无效")
+
+        # 创建恢复会话
+        recovery_id = secrets.token_hex(16)
+        session = RecoverySession(
+            id=recovery_id,
+            user_id=user.id,
+            new_public_key=req.new_public_key,
+        )
+        db.add(session)
+        db.commit()
+
+        # 发送邮箱验证码
+        code = email_svc.generate_email_code(_settings.email_code_length)
+        send_result = email_svc.send_verification_code(_settings, user.email, code)
+        if not send_result.ok:
+            db.delete(session)
+            db.commit()
+            raise HTTPException(status_code=502, detail=f"邮件发送失败: {send_result.error}")
+
+        now = utcnow()
+        session.email_code_hash = hash_email_code(code)
+        session.email_code_expires_at = now + timedelta(seconds=_settings.email_code_ttl)
+        session.email_code_attempts = 0
+        db.commit()
+
+        logger.info("恢复开始: user_id=%d", user.id)
+        return RecoverStartResp(recovery_id=recovery_id)
+
+    @app.post("/api/auth/recover/confirm", response_model=RecoverConfirmResp)
+    def recover_confirm(req: RecoverConfirmReq, db: Session = Depends(_get_db)):
+        """私钥丢失恢复 — 第二步：提交邮箱验证码，绑定新公钥。
+
+        成功后:
+        - 公钥替换为新公钥
+        - User ID 保持不变
+        - 历史数据 (nodes) 不变
+        - 旧 token 全部失效（旧私钥已无法使用）
+        """
+        session = db.get(RecoverySession, req.recovery_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="恢复会话不存在")
+
+        if session.completed:
+            raise HTTPException(status_code=410, detail="恢复已完成")
+
+        now = utcnow()
+
+        # 过期检查
+        if session.email_code_expires_at is None or session.email_code_expires_at < now:
+            raise HTTPException(status_code=410, detail="验证码已过期")
+
+        # 尝试次数限制
+        if session.email_code_attempts >= _settings.email_code_max_attempts:
+            raise HTTPException(status_code=429, detail="验证码尝试次数过多，请重新发起恢复")
+
+        # 验证验证码
+        if not verify_email_code(session.email_code_hash, req.code):
+            session.email_code_attempts += 1
+            db.commit()
+            raise HTTPException(
+                status_code=401,
+                detail=f"验证码错误（剩余尝试次数: {_settings.email_code_max_attempts - session.email_code_attempts}）",
+            )
+
+        # 执行恢复: 替换公钥 + 使旧 token 失效
+        user = db.get(User, session.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        user.public_key = session.new_public_key
+        user.updated_at = now
+
+        # 使该用户所有旧 token 失效
+        from sqlalchemy import delete as sql_delete
+        db.execute(sql_delete(AccessToken).where(AccessToken.user_id == user.id))
+
+        session.completed = True
+        db.commit()
+
+        logger.info("恢复完成: user_id=%d", user.id)
+        return RecoverConfirmResp(ok=True, user_id=user.id, message="恢复成功，新公钥已绑定")
+
     @app.get("/api/health")
     def health():
         """健康检查。"""
@@ -683,11 +806,25 @@ GET /api/me
   返回: {user_id, email, public_key, account_mode, email_verified, created_at}
 
 POST /api/me/rotate-key
-  公钥轮换 (User ID 和历史数据不变)
+  公钥轮换 (还有旧私钥时, User ID 和历史数据不变)
   请求头: Authorization: Bearer <token>
   请求: {"new_public_key": "<64 hex>", "signature": "<128 hex>"}
   说明: signature = 旧私钥对 "rotate-key:{new_public_key}" 的 UTF-8 字节的 Ed25519 签名
   返回: {"ok": true, "user_id": 1, "public_key": "<新公钥>"}
+
+[账户恢复 — 私钥彻底丢失时, 无需 token]
+
+POST /api/auth/recover/start
+  发起恢复: 提交 user_id + 新公钥, 服务器向注册邮箱发送验证码
+  请求: {"user_id": 1, "new_public_key": "<64 hex>"}
+  返回: {"recovery_id": "..."}
+  说明: 客户端需先生成新 Ed25519 密钥对
+
+POST /api/auth/recover/confirm
+  确认恢复: 提交邮箱验证码, 绑定新公钥
+  请求: {"recovery_id": "...", "code": "123456"}
+  返回: {"ok": true, "user_id": 1, "message": "恢复成功"}
+  说明: 恢复后 User ID 和历史数据不变, 旧 token 全部失效
 
 [其他]
 
@@ -697,9 +834,10 @@ GET /api/health
 
 速率限制 (IP 级, 滑动窗口)
 --------------------------
-POST /api/auth/challenge    10 次/分钟
-POST /api/register/start    5 次/小时
-POST /api/nodes             60 次/小时
+POST /api/auth/challenge     10 次/分钟
+POST /api/register/start     5 次/小时
+POST /api/auth/recover/start 3 次/小时
+POST /api/nodes              60 次/小时
 超出限制返回 HTTP 429
 
 错误格式

@@ -396,6 +396,112 @@ class TestRateLimit:
         assert r.status_code == 429
 
 
+class TestRecovery:
+    def test_full_recovery_flow(self, patched_client):
+        """私钥丢失 → 邮箱恢复 → 新公钥可用。"""
+        user_id, old_priv, old_pub = do_register(patched_client, email="recover@test.com")
+        old_token = do_auth(patched_client, user_id, old_priv)
+        c, _, codes = patched_client
+
+        # 发布一条信息（恢复后应仍存在）
+        r = c.post("/api/nodes", json={"content": "before recovery"},
+                   headers={"Authorization": f"Bearer {old_token}"})
+        assert r.status_code == 201
+        node_id = r.json()["id"]
+
+        # 模拟私钥丢失：生成新密钥对
+        new_priv, new_pub = crypto.generate_keypair()
+
+        # 1. 发起恢复
+        r = c.post("/api/auth/recover/start", json={
+            "user_id": user_id,
+            "new_public_key": new_pub,
+        })
+        assert r.status_code == 200, r.text
+        recovery_id = r.json()["recovery_id"]
+
+        # 2. 确认恢复（用邮箱验证码）
+        code = codes[f"recover@test.com"]
+        r = c.post("/api/auth/recover/confirm", json={
+            "recovery_id": recovery_id,
+            "code": code,
+        })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True
+        assert data["user_id"] == user_id
+
+        # 3. 旧 token 应已失效
+        r = c.get("/api/me", headers={"Authorization": f"Bearer {old_token}"})
+        assert r.status_code == 401
+
+        # 4. 用新密钥认证
+        new_token = do_auth(patched_client, user_id, new_priv)
+        assert len(new_token) == 64
+
+        # 5. 历史数据仍在
+        r = c.get(f"/api/nodes/{node_id}")
+        assert r.status_code == 200
+        assert r.json()["content"] == "before recovery"
+        assert r.json()["user_id"] == user_id
+
+    def test_recovery_nonexistent_user(self, patched_client):
+        c, _, _ = patched_client
+        _, new_pub = crypto.generate_keypair()
+        r = c.post("/api/auth/recover/start", json={
+            "user_id": 99999,
+            "new_public_key": new_pub,
+        })
+        assert r.status_code == 404
+
+    def test_recovery_bad_public_key(self, patched_client):
+        user_id, _, _ = do_register(patched_client, email="recbad@test.com")
+        c, _, _ = patched_client
+        r = c.post("/api/auth/recover/start", json={
+            "user_id": user_id,
+            "new_public_key": "invalid",
+        })
+        assert r.status_code == 400
+
+    def test_recovery_wrong_code(self, patched_client):
+        user_id, _, _ = do_register(patched_client, email="recwrong@test.com")
+        c, _, codes = patched_client
+        _, new_pub = crypto.generate_keypair()
+
+        r = c.post("/api/auth/recover/start", json={
+            "user_id": user_id,
+            "new_public_key": new_pub,
+        })
+        recovery_id = r.json()["recovery_id"]
+
+        r = c.post("/api/auth/recover/confirm", json={
+            "recovery_id": recovery_id,
+            "code": "000000",
+        })
+        assert r.status_code == 401
+
+    def test_recovery_reuse(self, patched_client):
+        """恢复会话只能用一次。"""
+        user_id, _, _ = do_register(patched_client, email="recreuse@test.com")
+        c, _, codes = patched_client
+        _, new_pub = crypto.generate_keypair()
+
+        r = c.post("/api/auth/recover/start", json={
+            "user_id": user_id,
+            "new_public_key": new_pub,
+        })
+        recovery_id = r.json()["recovery_id"]
+        code = codes["recreuse@test.com"]
+
+        # 第一次成功
+        r1 = c.post("/api/auth/recover/confirm", json={"recovery_id": recovery_id, "code": code})
+        assert r1.status_code == 200
+
+        # 第二次应被拒绝
+        r2 = c.post("/api/auth/recover/confirm", json={"recovery_id": recovery_id, "code": code})
+        assert r2.status_code == 410
+
+
 class TestHealth:
     def test_health(self, patched_client):
         c, _, _ = patched_client

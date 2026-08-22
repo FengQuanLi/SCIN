@@ -105,6 +105,20 @@ class AuthChallenge(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 
 
+class RecoverySession(Base):
+    """私钥丢失恢复会话。"""
+    __tablename__ = "recovery_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    new_public_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    email_code_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    email_code_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    email_code_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+
 class AccessToken(Base):
     __tablename__ = "access_tokens"
 
