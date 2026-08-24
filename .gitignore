@@ -12,3 +12,9 @@ _deploy.tgz
 _sn_*.tgz
 *.tar.gz
 _boot/
+
+# 桥接身份/私钥（local_identity.json 等含 Ed25519 私钥，绝不入库）
+local_identity.json
+local_keypair.json
+local_register_start.json
+scin_bridge/
