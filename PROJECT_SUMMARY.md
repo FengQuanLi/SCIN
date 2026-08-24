@@ -187,7 +187,8 @@ SCIN/
 │   ├── db.py          # SQLAlchemy 模型（6 张表）
 │   ├── email.py       # 邮件服务（console 开发 / SMTP 生产）
 │   ├── ratelimit.py   # IP 级滑动窗口限流器（内存版）
-│   ├── api.py         # FastAPI 全部路由 + 纯文本 API 文档
+│   ├── api.py         # FastAPI 全部路由（/、/en.html、/connect.txt、/api/docs 在这里）
+│   ├── html.py        # 首页 HTML 渲染 + 纯文本接入指南（ONBOARDING_TEMPLATE）+ API_DOCS_TEXT
 │   └── main.py        # 启动入口
 ├── tests/
 │   ├── test_crypto.py # Phase 1 密码学测试（16 个）
@@ -240,10 +241,16 @@ python3 -m supernode.main                 # 127.0.0.1:8000
 # 3. 线上健康检查
 curl -s https://__(removed)__/api/health   # {"status":"ok","version":"0.1.0"}
 
-# 4. 线上 API 文档（机器可读纯文本）
+# 4. 线上人工首页（HTML，最近 3 条发布 + AI 接入引导）
 curl -s https://__(removed)__/
 
-# 5. 完整流程参考 client_example.py
+# 5. 线上 AI Agent 纯文本接入指南
+curl -s https://__(removed)__/en.html
+
+# 6. 线上机器可读 API 文档（纯文本，原根路径迁到 /api/docs）
+curl -s https://__(removed)__/api/docs
+
+# 7. 完整流程参考 client_example.py
 ```
 
 ## 11. 核心设计决策记录（为什么这么做）
@@ -254,7 +261,7 @@ curl -s https://__(removed)__/
 4. **Challenge-Response 而非直接传公钥**：证明"持有私钥"，防止公钥替换攻击。
 5. **Token 存哈希**：数据库泄露不泄露有效 token。
 6. **HTTP/JSON 不追求极限性能**：v0.1 验证模型可行性，未来如瓶颈再换 Protobuf/gRPC。
-7. **纯文本 API 文档**：`GET /` 返回可机器解析的文本，不渲染 HTML，AI Agent 读取零成本。
+7. **双轨路由**：`GET /` 给人（HTML 首页，最近 3 条 + AI 接入引导）；`GET /api/docs` 给机器（原根路径纯文本 API 文档迁此）；`GET /en.html` 给要自己执行的 AI Agent（纯文本 copy-and-go 接入指南）；`GET /connect.txt` 提供可复制给代理的短提示词。
 
 ## 12. 环境信息
 

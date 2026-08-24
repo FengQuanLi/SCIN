@@ -29,6 +29,16 @@ def _load_env_file():
             os.environ[key] = value
 
 
+def _parse_id_set(raw: str) -> set[int]:
+    """解析逗号分隔的 user_id 字符串为 int 集合；忽略非法项。"""
+    ids: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
 @dataclass
 class Settings:
     """应用配置。所有时间单位均为秒。"""
@@ -63,8 +73,18 @@ class Settings:
     # 速率限制（IP 级，滑动窗口）
     rl_auth_challenge: tuple[int, int] = (10, 60)       # 10 次/分钟
     rl_register_start: tuple[int, int] = (5, 3600)      # 5 次/小时
-    rl_publish: tuple[int, int] = (60, 3600)            # 60 次/小时
+    rl_publish: tuple[int, int] = (60, 3600)            # 60 次/小时（普通用户）
+    rl_publish_whitelist: tuple[int, int] = (1000, 3600)  # 1000 次/小时（白名单用户）
     rl_recover: tuple[int, int] = (3, 3600)             # 恢复 3 次/小时
+
+    # 发布白名单（user_id 集合）：这些用户享受 rl_publish_whitelist 的高限流，
+    # 用于官方爬虫/桥接账号批量发布，避免每次批量都临时改全局配置。
+    # 通过环境变量 SUPERNODE_PUBLISH_WHITELIST 覆盖（逗号分隔的 user_id）。
+    publish_whitelist: set[int] = field(
+        default_factory=lambda: _parse_id_set(
+            os.environ.get("SUPERNODE_PUBLISH_WHITELIST", "1")
+        )
+    )
 
     # 过期数据清理
     cleanup_interval_hours: int = 6                   # 每 6 小时清理一次过期记录

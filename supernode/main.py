@@ -25,7 +25,9 @@ def main():
     app = create_app(settings)
 
     print(f"SuperNode v0.1 启动: http://{settings.host}:{settings.port}")
-    print(f"API 文档: http://{settings.host}:{settings.port}/docs")
+    print(f"人工首页: http://{settings.host}:{settings.port}/")
+    print(f"AI 接入指南: http://{settings.host}:{settings.port}/en.html")
+    print(f"API 文档: http://{settings.host}:{settings.port}/api/docs")
     print(f"邮件后端: {settings.email_backend}")
     print(f"数据库: {settings.database_url}\n")
 

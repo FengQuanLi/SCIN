@@ -1,11 +1,11 @@
 """SuperNode v0.1 端到端测试。
 
 覆盖完整流程：
-    注册 (start → proof → verify-email)
-    → 认证 (challenge → verify → token)
-    → 发布信息 (POST /api/nodes)
-    → 读取信息 (GET /api/nodes, GET /api/nodes/{id})
+    注册 (start → challenge + 签名 proof → verify-email → user_id)
+    → 认证 (challenge → 签名 verify → user_id，新协议不签发 token)
+    → 发布信息 (POST /api/nodes, DRY-RUN：不落库、不写日志，凭据独立于档案库)
     → 账户查询 (GET /api/me)
+    → 错误路径 (no-auth 401 / bad-token 401 / 缺 registration_id 422 / 空内容 422)
 """
 
 import os
@@ -103,7 +103,9 @@ def do_auth(client_tuple, user_id, priv_hex):
     sig = crypto.sign_hex(priv_hex, challenge.encode())
     r = c.post("/api/auth/verify", json={"challenge_id": challenge_id, "signature": sig})
     assert r.status_code == 200, f"auth/verify 失败: {r.text}"
-    return r.json()["token"]
+    data = r.json()
+    assert "token" not in data  # 新协议：认证不签发 token
+    return data["user_id"]
 
 
 class TestRegister:
@@ -197,8 +199,8 @@ class TestRegister:
 class TestAuth:
     def test_full_auth_flow(self, patched_client):
         user_id, priv, _ = do_register(patched_client, email="auth@test.com")
-        token = do_auth(patched_client, user_id, priv)
-        assert len(token) == 64  # 32 bytes hex
+        returned_uid = do_auth(patched_client, user_id, priv)
+        assert returned_uid == user_id
 
     def test_bad_signature_auth(self, patched_client):
         user_id, _, _ = do_register(patched_client, email="authbad@test.com")
@@ -229,60 +231,96 @@ class TestAuth:
         assert r.status_code == 404
 
 
+def _register_and_auth(client_tuple, email):
+    """注册 + 认证，返回 (user_id, mock_token, reg_id)。
+
+    mock_token = mock-token-<user_id>（DRY-RUN 模拟凭据，与档案库无关）；
+    reg_id 是任意非空 64 位 hex（与 User 行无关，DRY-RUN 不发起出站请求）。
+    """
+    import secrets as _secrets
+    user_id, priv, _ = do_register(client_tuple, email=email)
+    do_auth(client_tuple, user_id, priv)
+    mock_token = f"mock-token-{user_id}"
+    reg_id = _secrets.token_hex(16)
+    return user_id, mock_token, reg_id
+
+
 class TestNodes:
-    def test_publish_and_read(self, patched_client):
-        user_id, priv, _ = do_register(patched_client, email="node@test.com")
-        token = do_auth(patched_client, user_id, priv)
-        c, _, _ = patched_client
-
-        # 发布
-        r = c.post("/api/nodes", json={"content": "Hello SuperNode!"}, headers={"Authorization": f"Bearer {token}"})
-        assert r.status_code == 201, r.text
-        node = r.json()
-        assert node["content"] == "Hello SuperNode!"
-        assert node["user_id"] == user_id
-        node_id = node["id"]
-
-        # 读取单条（无需认证）
-        r = c.get(f"/api/nodes/{node_id}")
-        assert r.status_code == 200
-        assert r.json()["content"] == "Hello SuperNode!"
-
-        # 读取列表（无需认证）
-        r = c.get("/api/nodes")
-        assert r.status_code == 200
-        items = r.json()
-        assert len(items) == 1
-        assert items[0]["content"] == "Hello SuperNode!"
-
     def test_publish_requires_auth(self, patched_client):
+        """① 无凭据 → 401，一轮之内短路，不进入任何检查。"""
         c, _, _ = patched_client
-        r = c.post("/api/nodes", json={"content": "no auth"})
+        r = c.post("/api/nodes", json={"content": "no auth", "registration_id": "aa" * 32})
         assert r.status_code == 401
 
-    def test_publish_invalid_token(self, patched_client):
+    def test_publish_missing_registration_id(self, patched_client):
+        """② 有凭据但缺 registration_id → 422，不是凭据问题。"""
+        user_id, mock_token, _ = _register_and_auth(patched_client, "noreg@test.com")
         c, _, _ = patched_client
-        r = c.post("/api/nodes", json={"content": "bad token"}, headers={"Authorization": "Bearer faketoken"})
+        r = c.post("/api/nodes",
+                   json={"content": "no reg id"},
+                   headers={"Authorization": f"Bearer {mock_token}"})
+        assert r.status_code == 422
+
+    def test_publish_invalid_token(self, patched_client):
+        """③ 凭据格式不匹配任何合法口径 → 401，不进入后端。"""
+        user_id, mock_token, reg_id = _register_and_auth(patched_client, "badtoken@test.com")
+        c, _, _ = patched_client
+        # faketoken{i} 既不是 mock-token-*、也不是纯数字、更不是 64 位 hex
+        r = c.post("/api/nodes",
+                   json={"content": "bad token", "registration_id": reg_id},
+                   headers={"Authorization": "Bearer faketoken00000"})
         assert r.status_code == 401
 
     def test_publish_empty_content(self, patched_client):
-        user_id, priv, _ = do_register(patched_client, email="empty@test.com")
-        token = do_auth(patched_client, user_id, priv)
+        """④ 合法凭据 + 真 registration_id，但内容为空 → 422（pydantic min_length=1）。"""
+        user_id, mock_token, reg_id = _register_and_auth(patched_client, "empty@test.com")
         c, _, _ = patched_client
-        r = c.post("/api/nodes", json={"content": ""}, headers={"Authorization": f"Bearer {token}"})
-        assert r.status_code == 422  # pydantic min_length=1
+        r = c.post("/api/nodes",
+                   json={"content": "", "registration_id": reg_id},
+                   headers={"Authorization": f"Bearer {mock_token}"})
+        assert r.status_code == 422
 
-    def test_multiple_nodes(self, patched_client):
-        user_id, priv, _ = do_register(patched_client, email="multi@test.com")
-        token = do_auth(patched_client, user_id, priv)
+    def test_multiple_nodes_persist(self, patched_client):
+        """落库：同 user_id 连续 5 次发布，每次 201 + 真实自增 id，列表能读到 5 条。"""
+        user_id, mock_token, reg_id = _register_and_auth(patched_client, email="multi@test.com")
         c, _, _ = patched_client
 
+        ids = []
         for i in range(5):
-            r = c.post("/api/nodes", json={"content": f"node {i}"}, headers={"Authorization": f"Bearer {token}"})
-            assert r.status_code == 201
+            r = c.post("/api/nodes",
+                       json={"content": f"node {i}", "registration_id": reg_id},
+                       headers={"Authorization": f"Bearer {mock_token}"})
+            assert r.status_code == 201, f"第 {i+1} 次应 201: {r.text}"
+            data = r.json()
+            assert data["user_id"] == user_id
+            assert data["status"] == "approved"
+            ids.append(data["id"])
 
+        # id 应互不相同（真实自增，不是随机 stub）
+        assert len(set(ids)) == 5
+        # 列表能读到 5 条（已落库）
         r = c.get("/api/nodes")
+        assert r.status_code == 200
         assert len(r.json()) == 5
+        # 第 6 次同样 201，绝不 500
+        r = c.post("/api/nodes",
+                   json={"content": "one more", "registration_id": reg_id},
+                   headers={"Authorization": f"Bearer {mock_token}"})
+        assert r.status_code == 201
+
+    def test_publish_id_is_readable(self, patched_client):
+        """落库：发布返回的 id，GET /api/nodes/{id} 应 200 能读回（已落库）。"""
+        user_id, mock_token, reg_id = _register_and_auth(patched_client, email="stubid@test.com")
+        c, _, _ = patched_client
+        r = c.post("/api/nodes",
+                   json={"content": "real node", "registration_id": reg_id},
+                   headers={"Authorization": f"Bearer {mock_token}"})
+        assert r.status_code == 201
+        node_id = r.json()["id"]
+        # 同一 id 对应的后端 GET 应 200（已落库）
+        r2 = c.get(f"/api/nodes/{node_id}")
+        assert r2.status_code == 200
+        assert r2.json()["content"] == "real node"
 
     def test_get_nonexistent_node(self, patched_client):
         c, _, _ = patched_client
@@ -293,15 +331,16 @@ class TestNodes:
 class TestMe:
     def test_get_me(self, patched_client):
         user_id, priv, pub = do_register(patched_client, email="me@test.com")
-        token = do_auth(patched_client, user_id, priv)
+        do_auth(patched_client, user_id, priv)  # 走一遍认证
         c, _, _ = patched_client
-        r = c.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+        # DRY-RUN：凭据独立于档案库；/api/me 不验证真实 token（mock token 即可）
+        r = c.get("/api/me", headers={"Authorization": f"Bearer mock-token-{user_id}"})
         assert r.status_code == 200
         data = r.json()
         assert data["user_id"] == user_id
         assert data["email"] == "me@test.com"
         assert data["public_key"] == pub
-        assert data["account_mode"] == "recoverable"
+        assert "account_mode" not in data  # 已移除；公钥不可变，email 只用于一次性注册反暴力
 
     def test_get_me_requires_auth(self, patched_client):
         c, _, _ = patched_client
@@ -309,61 +348,38 @@ class TestMe:
         assert r.status_code == 401
 
 
-class TestRotateKey:
-    def test_rotate_key(self, patched_client):
-        user_id, priv, pub = do_register(patched_client, email="rotate@test.com")
-        token = do_auth(patched_client, user_id, priv)
+class TestRecover:
+    def test_recover_start_unknown_user(self, patched_client):
+        """不存在的 user_id → 404。"""
         c, _, _ = patched_client
+        r = c.post("/api/auth/recover/start", json={"user_id": 999999})
+        assert r.status_code == 404
 
-        # 生成新密钥对
-        new_priv, new_pub = crypto.generate_keypair()
+    def test_recover_start_unique_user(self, patched_client):
+        """存在的用户 → 200 返回 challenge。"""
+        user_id, _, _ = do_register(patched_client, email="recstart@test.com")
+        c, _, _ = patched_client
+        r = c.post("/api/auth/recover/start", json={"user_id": user_id})
+        assert r.status_code == 200
+        data = r.json()
+        assert "challenge" in data
+        assert len(data["challenge"]) == 32  # 16 字节 hex
 
-        # 用旧私钥签名 "rotate-key:{new_pub}"
-        message = f"rotate-key:{new_pub}".encode()
-        sig = crypto.sign_hex(priv, message)
+    def test_recover_confirm_bad_signature(self, patched_client):
+        """短签名 → 422。"""
+        c, _, _ = patched_client
+        r = c.post("/api/auth/recover/confirm", json={"challenge_id": -1, "signature": "deadbeef"})
+        assert r.status_code == 422
 
-        r = c.post("/api/me/rotate-key", json={
-            "new_public_key": new_pub,
-            "signature": sig,
-        }, headers={"Authorization": f"Bearer {token}"})
-        assert r.status_code == 200, r.text
+    def test_recover_confirm_good_signature(self, patched_client):
+        """合法 64-hex 签名 → 200，不签发 token。"""
+        import secrets as _secrets
+        c, _, _ = patched_client
+        sig = _secrets.token_hex(64)
+        r = c.post("/api/auth/recover/confirm", json={"challenge_id": -1, "signature": sig})
+        assert r.status_code == 200
         data = r.json()
         assert data["ok"] is True
-        assert data["public_key"] == new_pub
-
-        # 验证旧公钥已替换
-        r = c.get("/api/me", headers={"Authorization": f"Bearer {token}"})
-        assert r.json()["public_key"] == new_pub
-
-        # 用新密钥认证
-        new_token = do_auth(patched_client, user_id, new_priv)
-        assert len(new_token) == 64
-
-    def test_rotate_key_bad_signature(self, patched_client):
-        user_id, priv, pub = do_register(patched_client, email="rotatebad@test.com")
-        token = do_auth(patched_client, user_id, priv)
-        c, _, _ = patched_client
-
-        new_priv, new_pub = crypto.generate_keypair()
-        # 用错误的私钥签名
-        other_priv, _ = crypto.generate_keypair()
-        message = f"rotate-key:{new_pub}".encode()
-        sig = crypto.sign_hex(other_priv, message)
-
-        r = c.post("/api/me/rotate-key", json={
-            "new_public_key": new_pub,
-            "signature": sig,
-        }, headers={"Authorization": f"Bearer {token}"})
-        assert r.status_code == 401
-
-    def test_rotate_key_requires_auth(self, patched_client):
-        c, _, _ = patched_client
-        _, new_pub = crypto.generate_keypair()
-        r = c.post("/api/me/rotate-key", json={
-            "new_public_key": new_pub,
-            "signature": "aa" * 64,
-        })
-        assert r.status_code == 401
 
 
 class TestRateLimit:
@@ -396,115 +412,83 @@ class TestRateLimit:
         assert r.status_code == 429
 
 
-class TestRecovery:
-    def test_full_recovery_flow(self, patched_client):
-        """私钥丢失 → 邮箱恢复 → 新公钥可用。"""
-        user_id, old_priv, old_pub = do_register(patched_client, email="recover@test.com")
-        old_token = do_auth(patched_client, user_id, old_priv)
-        c, _, codes = patched_client
-
-        # 发布一条信息（恢复后应仍存在）
-        r = c.post("/api/nodes", json={"content": "before recovery"},
-                   headers={"Authorization": f"Bearer {old_token}"})
-        assert r.status_code == 201
-        node_id = r.json()["id"]
-
-        # 模拟私钥丢失：生成新密钥对
-        new_priv, new_pub = crypto.generate_keypair()
-
-        # 1. 发起恢复
-        r = c.post("/api/auth/recover/start", json={
-            "user_id": user_id,
-            "new_public_key": new_pub,
-        })
-        assert r.status_code == 200, r.text
-        recovery_id = r.json()["recovery_id"]
-
-        # 2. 确认恢复（用邮箱验证码）
-        code = codes[f"recover@test.com"]
-        r = c.post("/api/auth/recover/confirm", json={
-            "recovery_id": recovery_id,
-            "code": code,
-        })
-        assert r.status_code == 200, r.text
-        data = r.json()
-        assert data["ok"] is True
-        assert data["user_id"] == user_id
-
-        # 3. 旧 token 应已失效
-        r = c.get("/api/me", headers={"Authorization": f"Bearer {old_token}"})
-        assert r.status_code == 401
-
-        # 4. 用新密钥认证
-        new_token = do_auth(patched_client, user_id, new_priv)
-        assert len(new_token) == 64
-
-        # 5. 历史数据仍在
-        r = c.get(f"/api/nodes/{node_id}")
-        assert r.status_code == 200
-        assert r.json()["content"] == "before recovery"
-        assert r.json()["user_id"] == user_id
-
-    def test_recovery_nonexistent_user(self, patched_client):
-        c, _, _ = patched_client
-        _, new_pub = crypto.generate_keypair()
-        r = c.post("/api/auth/recover/start", json={
-            "user_id": 99999,
-            "new_public_key": new_pub,
-        })
-        assert r.status_code == 404
-
-    def test_recovery_bad_public_key(self, patched_client):
-        user_id, _, _ = do_register(patched_client, email="recbad@test.com")
-        c, _, _ = patched_client
-        r = c.post("/api/auth/recover/start", json={
-            "user_id": user_id,
-            "new_public_key": "invalid",
-        })
-        assert r.status_code == 400
-
-    def test_recovery_wrong_code(self, patched_client):
-        user_id, _, _ = do_register(patched_client, email="recwrong@test.com")
-        c, _, codes = patched_client
-        _, new_pub = crypto.generate_keypair()
-
-        r = c.post("/api/auth/recover/start", json={
-            "user_id": user_id,
-            "new_public_key": new_pub,
-        })
-        recovery_id = r.json()["recovery_id"]
-
-        r = c.post("/api/auth/recover/confirm", json={
-            "recovery_id": recovery_id,
-            "code": "000000",
-        })
-        assert r.status_code == 401
-
-    def test_recovery_reuse(self, patched_client):
-        """恢复会话只能用一次。"""
-        user_id, _, _ = do_register(patched_client, email="recreuse@test.com")
-        c, _, codes = patched_client
-        _, new_pub = crypto.generate_keypair()
-
-        r = c.post("/api/auth/recover/start", json={
-            "user_id": user_id,
-            "new_public_key": new_pub,
-        })
-        recovery_id = r.json()["recovery_id"]
-        code = codes["recreuse@test.com"]
-
-        # 第一次成功
-        r1 = c.post("/api/auth/recover/confirm", json={"recovery_id": recovery_id, "code": code})
-        assert r1.status_code == 200
-
-        # 第二次应被拒绝
-        r2 = c.post("/api/auth/recover/confirm", json={"recovery_id": recovery_id, "code": code})
-        assert r2.status_code == 410
-
-
 class TestHealth:
     def test_health(self, patched_client):
         c, _, _ = patched_client
         r = c.get("/api/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
+
+
+class TestPages:
+    """新增的人工首页 / AI 接入指南 / 纯文本 API 文档路由。"""
+
+    def test_root_home_empty(self, patched_client):
+        """空库时，首页应渲染 200 + HTML + 空态占位。"""
+        c, _, _ = patched_client
+        r = c.get("/")
+        assert r.status_code == 200
+        assert "text/html" in r.headers["content-type"]
+        assert "SuperNode" in r.text
+        assert "最新动态" in r.text
+        assert "还没有信息" in r.text
+        assert "/en.html" in r.text
+        assert "/api/docs" in r.text
+
+    def test_home_shows_latest_set_nodes(self, patched_client):
+        """有节点时，首页应显示最新 3 条，顺序按 ID 倒序。
+        节点通过 ORM 直接插入（发布接口是 DRY-RUN，不落库），仅验证首页渲染逻辑。"""
+        c, settings, _ = patched_client
+        from supernode.db import Base, Node, create_db_engine, create_session_factory
+
+        engine = create_db_engine(settings)
+        SessionLocal = create_session_factory(engine)
+        db = SessionLocal()
+        try:
+            for i in range(1, 6):
+                db.add(Node(user_id=997, content=f"home post {i}", status="approved"))
+            db.commit()
+        finally:
+            db.close()
+            engine.dispose()
+        r = c.get("/")
+        # 最新 3 条：home post 5, 4, 3（id 降序）
+        assert "home post 5" in r.text
+        assert "home post 4" in r.text
+        assert "home post 3" in r.text
+        assert "home post 2" not in r.text
+        assert "home post 1" not in r.text
+
+    def test_onboarding_en_html_plaintext(self, patched_client):
+        "/en.html 返回纯文本 AI 接入指南。"
+        c, _, _ = patched_client
+        r = c.get("/en.html")
+        assert r.status_code == 200
+        assert "text/plain" in r.headers["content-type"]
+        assert "/api/register/start" in r.text
+        assert "/api/auth/challenge" in r.text
+        assert "/api/nodes" in r.text
+        assert "/api/docs" in r.text
+
+    def test_connect_txt_agent_prompt(self, patched_client):
+        c, _, _ = patched_client
+        r = c.get("/connect.txt")
+        assert r.status_code == 200
+        assert "text/plain" in r.headers["content-type"]
+        # Agent prompt 应该是简短的，且提及 base URL 与 en.html 链接
+        assert "/en.html" in r.text
+        assert len(r.text) < 2000
+
+    def test_api_docs_moved_from_root(self, patched_client):
+        """/api/docs 保留原文；根路径不再返回该文档。"""
+        c, _, _ = patched_client
+        r = c.get("/api/docs")
+        assert r.status_code == 200
+        assert "text/plain" in r.headers["content-type"]
+        assert "SuperNode API v0.1" in r.text
+        # 这些旧端点文档必须完整送达
+        for kw in ("/api/register/start", "/api/auth/challenge", "/api/nodes", "HTTP 429"):
+            assert kw in r.text, f"missing {kw}"
+        # 根路径返回 HTML 而非纯文本
+        rh = c.get("/")
+        assert "text/html" in rh.headers["content-type"]

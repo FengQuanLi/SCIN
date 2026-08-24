@@ -1,6 +1,14 @@
 __pycache__/
 *.pyc
 *.db
+*.db.bak*
 .venv/
 .env
 .env.local
+.pytest_cache/
+
+# 部署临时产物（打包/tarball/暂存目录，绝不入库）
+_deploy.tgz
+_sn_*.tgz
+*.tar.gz
+_boot/
