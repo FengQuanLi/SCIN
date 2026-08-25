@@ -18,3 +18,8 @@ local_identity.json
 local_keypair.json
 local_register_start.json
 scin_bridge/
+
+# 部署/翻译产物及本地运行文件
+*.tar.gz
+.env
+supernode.db
