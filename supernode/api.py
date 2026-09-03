@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, and_, or_, func, delete
 from sqlalchemy.orm import Session
 
 from . import crypto, email as email_svc
@@ -34,9 +34,12 @@ from .db import (
     AccessToken,
     AuthChallenge,
     Base,
+    Comment,
     Node,
     RegistrationSession,
     User,
+    Vote,
+    WordCoord,
     create_db_engine,
     create_session_factory,
     hash_token,
@@ -91,6 +94,8 @@ def _get_db() -> Session:
 class RegisterStartReq(BaseModel):
     email: str
     public_key: str
+    display_name: str = Field(default="", max_length=80, description="昵称（可选，注册时可填）")
+    bio: str = Field(default="", max_length=500, description="简介（可选，注册时可填）")
 
 
 class RegisterStartResp(BaseModel):
@@ -119,6 +124,21 @@ class RegisterVerifyEmailResp(BaseModel):
     message: str = ""
 
 
+class RecoverStartReq(BaseModel):
+    user_id: int
+
+
+class RecoverConfirmReq(BaseModel):
+    registration_id: str
+    code: str
+    new_public_key: str
+
+
+class UpdateProfileReq(BaseModel):
+    display_name: str | None = Field(default=None, max_length=80)
+    bio: str | None = Field(default=None, max_length=500)
+
+
 class AuthChallengeReq(BaseModel):
     user_id: int
 
@@ -138,16 +158,41 @@ class AuthVerifyResp(BaseModel):
 
 
 class NodeCreateReq(BaseModel):
+    """发布信息请求（严格模式 v0.4）。
+
+    必填：content / title / summary / tags / author_handle / date_from / date_to
+    服务端额外校验：
+      - tags 每个词必须出现在 title+summary+content 中（防幻觉，违反 → 422）
+      - date_from / date_to 格式 YYYY-MM-DD，且 date_from <= date_to
+    """
     content: str = Field(..., min_length=1)
     registration_id: str = ""
+    title: str = Field(..., min_length=1, max_length=120, description="标题，必填")
+    summary: str = Field(..., min_length=1, max_length=2000, description="摘要，必填")
+    description: str = Field(default="")
+    tags: str = Field(..., min_length=1, max_length=500, description="关键词，逗号分隔，必填；每个词必须出现在正文/标题/摘要中")
+    source_ref: str = Field(default="")
+    doc_type: int = Field(default=1, ge=0, le=4)
+    lang: str = Field(default="mix", pattern=r"^(zh|en|mix)$")
+    author_handle: str = Field(..., min_length=1, max_length=120, description="作者署名，必填")
+    date_from: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="文章开始日期 YYYY-MM-DD，必填")
+    date_to: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="文章结束日期 YYYY-MM-DD，必填（单日用同一日期）")
+    pinned: int = Field(default=0, ge=0, le=1, description="1=首页置顶（可选，默认 0）")
+    currency: int = Field(default=9, ge=0, le=10)
 
 
 class NodeOut(BaseModel):
     id: int
+    title: str = ""
     content: str
     user_id: int
-    created_at: str
-    status: str
+    author_handle: str = ""
+    date_from: str = ""
+    date_to: str = ""
+    summary: str = ""
+    tags: str = ""
+    created_at: str | None = None
+    status: str | int
 
     model_config = {"from_attributes": True}
 
@@ -166,6 +211,20 @@ def _check_session_active(session: RegistrationSession, purpose: str) -> None:
 
 def _get_registered_user(db: Session, email: str) -> User | None:
     return db.scalar(select(User).where(User.email == email))
+
+
+def _check_muted(user: User) -> None:
+    """禁言检查：被禁言则 403。临时禁言看 mute_until，永久禁言看 muted_permanent。"""
+    if user.muted_permanent:
+        raise HTTPException(status_code=403, detail="你已被永久禁言，不能发帖/评论")
+    if user.mute_until is not None and user.mute_until > utcnow():
+        raise HTTPException(status_code=403, detail=f"你已被临时禁言，{user.mute_until.isoformat()} 后解除")
+
+
+def _require_admin(user: User) -> None:
+    """L1 管理员检查。"""
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
 
 
 def _extract_bearer(request: Request) -> str | None:
@@ -344,6 +403,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             id=registration_id,
             email=req.email,
             public_key=req.public_key,
+            display_name=req.display_name.strip(),
+            bio=req.bio.strip(),
             challenge=challenge,
             challenge_expires_at=now + timedelta(seconds=_settings.registration_challenge_ttl),
         )
@@ -441,6 +502,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             email=session.email,
             email_verified=True,
             public_key=session.public_key,
+            display_name=getattr(session, "display_name", "") or "",
+            bio=getattr(session, "bio", "") or "",
         )
         db.add(user)
         db.flush()  # 获取 user.id
@@ -506,35 +569,99 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return AuthVerifyResp(user_id=user.id)
 
-    # ── 恢复（用户特殊需要时开放，公钥仍可保持不变） ─────────────────────
-    # 注意：RecoverySession 表在第 18 节后被移除（与 rotate-key / account_mode 一并废弃），
-    # 这两条路由是空壳：只走 ratelimit + 用户存在检查 + 简单签名校验，
-    # 不写库、不发请求、只能用于协助"特别需要找回"的用户联系人工。
-    # 公钥本身不可变；找回流程本身不影响身份。
+    # ── 恢复（邮箱验证码换公钥：私钥丢失时的找回路径）─────────────────
+    # 场景：用户丢失 Ed25519 私钥（重装电脑等）。邮箱是唯一的找回凭据。
+    # 流程：
+    #   start   POST /api/auth/recover/start   {user_id}
+    #           → 向该用户注册邮箱发 6 位验证码，返回 registration_id
+    #   confirm POST /api/auth/recover/confirm {registration_id, code, new_public_key}
+    #           → 验证码正确 → 把 users.public_key 换成 new_public_key
+    # 安全：
+    #   - 验证码 15 分钟有效，最多 5 次错误尝试（复用 email_code_* 设置）
+    #   - 限流 3 次/小时（按 IP，rl_recover）
+    #   - 只能换成一个合法的 64-hex 公钥
+    #   - 换钥后旧私钥彻底失效（新身份 = 新公钥）
 
     @app.post("/api/auth/recover/start")
-    def auth_recover_start(req: AuthChallengeReq, request: Request, db: Session = Depends(_get_db)):
-        """恢复开始：用户提交 user_id，服务端返回一个 challenge。
-        与 /api/auth/challenge 同构，但 purpose 与限流独立（3 次/小时）。
-        """
+    def auth_recover_start(req: RecoverStartReq, request: Request, db: Session = Depends(_get_db)):
+        """恢复开始：提交 user_id，向注册邮箱发验证码。"""
         _rate_limit_check(request, "recover", _settings.rl_recover)
         user = db.get(User, req.user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
-        challenge = crypto.generate_challenge()
-        return {"challenge_id": -1, "challenge": challenge}
+
+        reg_id = secrets.token_hex(16)
+        now = utcnow()
+        # 复用 RegistrationSession 表存恢复会话
+        sess = RegistrationSession(
+            id=reg_id,
+            email=user.email,
+            public_key=user.public_key,  # 暂存旧公钥（confirm 时会被替换）
+            challenge=crypto.generate_challenge(),
+            challenge_expires_at=now + timedelta(seconds=_settings.registration_challenge_ttl),
+        )
+        # 发验证码
+        code = email_svc.generate_email_code(_settings.email_code_length)
+        send_result = email_svc.send_verification_code(_settings, user.email, code)
+        if not send_result.ok:
+            logger.warning("恢复验证码发送失败: user_id=%s error=%s", user.id, send_result.error)
+            raise HTTPException(status_code=502, detail="验证码发送失败，请稍后重试")
+        sess.email_code_hash = hash_email_code(code)
+        sess.email_code_expires_at = now + timedelta(seconds=_settings.email_code_ttl)
+        sess.email_code_attempts = 0
+        db.add(sess)
+        db.commit()
+        logger.info("恢复开始: user_id=%s reg_id=%s", user.id, reg_id)
+        return {
+            "ok": True,
+            "registration_id": reg_id,
+            "message": f"验证码已发送至 {user.email}，15 分钟内有效",
+        }
 
     @app.post("/api/auth/recover/confirm")
-    def auth_recover_confirm(req: AuthVerifyReq, db: Session = Depends(_get_db)):
-        """恢复确认：用户提交 signature（对 challenge 的签名）。
-        这里不签发任何 token（新协议），也不修改用户公钥。
-        只记录一次确认。
-        """
-        # 签名与 challenge 一一绑定；尚无持久化 challenge 池，
-        # v0.1 仅做格式校验和 200 回显，供内部人工兜底。
-        if not req.signature or len(req.signature) < 64:
-            raise HTTPException(status_code=422, detail="signature 不符合 64-hex 格式")
-        return {"ok": True, "message": "恢复请求已记录，请联系管理员"}
+    def auth_recover_confirm(req: RecoverConfirmReq, db: Session = Depends(_get_db)):
+        """恢复确认：验证码 + 新公钥，替换 users.public_key。"""
+        if not crypto.is_valid_public_key_hex(req.new_public_key):
+            raise HTTPException(status_code=400, detail="new_public_key 应为 64-hex")
+        session = db.get(RegistrationSession, req.registration_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="恢复会话不存在或已过期")
+        now = utcnow()
+        if session.email_code_expires_at is None or session.email_code_expires_at < now:
+            db.delete(session)
+            db.commit()
+            raise HTTPException(status_code=410, detail="验证码已过期，请重新发起恢复")
+        if session.email_code_attempts >= _settings.email_code_max_attempts:
+            db.delete(session)
+            db.commit()
+            raise HTTPException(status_code=429, detail="尝试次数过多，请重新发起恢复")
+        if not verify_email_code(session.email_code_hash, req.code):
+            session.email_code_attempts += 1
+            db.add(session)
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail=f"验证码错误（剩余尝试次数: {_settings.email_code_max_attempts - session.email_code_attempts}）",
+            )
+
+        # 验证码正确 → 换公钥
+        user_id_from_email = db.scalars(select(User).where(User.email == session.email)).first()
+        if user_id_from_email is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        old_key = user_id_from_email.public_key
+        user_id_from_email.public_key = req.new_public_key
+        user_id_from_email.updated_at = now
+        db.add(user_id_from_email)
+        # 清理恢复会话（一次性）
+        db.delete(session)
+        db.commit()
+        logger.info("公钥已更换: user_id=%s email=%s old=%s.. new=%s..",
+                    user_id_from_email.id, user_id_from_email.email, old_key[:8], req.new_public_key[:8])
+        return {
+            "ok": True,
+            "user_id": user_id_from_email.id,
+            "message": "公钥已更换。旧私钥现已失效，请妥善保管新私钥。",
+        }
 
     # ── 信息 ────────────────────────────────────────────────────────────
 
@@ -542,22 +669,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def list_nodes(
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        before_id: int = Query(default=None, ge=1, description="游标只取 id 小于此值（深翻页走主键索引秒回；给定时忽略 offset）"),
         db: Session = Depends(_get_db),
     ):
-        """获取公开信息列表（无需认证）。"""
+        """获取公开信息列表（无需认证）。
+
+        offset 翻页走 MariaDB filesort，offset 越深越慢；深翻页改用 before_id。
+        用法：第一次 limit=50；next 取上一页返回的【最小 id】当 before_id 再查。
+        """
+        conds = [Node.status.in_(["approved", "1"]), Node.deleted_at.is_(None)]
+        if author.strip():
+            conds.append(Node.author_handle.ilike(f"%{author.strip()}%"))
+        if before_id is not None:
+            conds.append(Node.id < before_id)
         rows = db.scalars(
             select(Node)
-            .where(Node.status == "approved")
-            .order_by(Node.created_at.desc(), Node.id.desc())
+            .where(*conds)
+            .order_by(Node.id.desc())
             .limit(limit)
-            .offset(offset)
         ).all()
         return [
             NodeOut(
                 id=n.id,
                 content=n.content,
                 user_id=n.user_id,
-                created_at=n.created_at.isoformat(),
+                created_at=n.created_at.isoformat() if n.created_at else None,
                 status=n.status,
             )
             for n in rows
@@ -567,13 +703,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def get_node(node_id: int, db: Session = Depends(_get_db)):
         """获取单条信息（无需认证）。"""
         node = db.get(Node, node_id)
-        if node is None or node.status not in ("approved", "pending"):
+        if node is None or node.status not in ("approved", "pending", "1"):
             raise HTTPException(status_code=404, detail="信息不存在")
         return NodeOut(
             id=node.id,
             content=node.content,
             user_id=node.user_id,
-            created_at=node.created_at.isoformat(),
+            created_at=node.created_at.isoformat() if node.created_at else None,
             status=node.status,
         )
 
@@ -634,7 +770,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     content=actual_json[:500],
                     user_id=0,
                     created_at=utcnow().isoformat(),
-                    status=(kind if kind in ("approved", "bypass") else "bypass"),
+                    status=1,
                 )
             raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <token>")
 
@@ -645,6 +781,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 3. 凭据无效/过期 → 401 短路，不再向后端传递
         user = _token_to_user(db, token)
 
+        # 3b. 禁言检查
+        _check_muted(user)
+
         # 4. 发布速率限制：白名单用户用高限流，普通用户用标准限流（均按 IP 计）
         if user.id in _settings.publish_whitelist:
             limit = _settings.rl_publish_whitelist
@@ -654,22 +793,185 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # 5. 空内容已由 pydantic min_length=1 拦为 422
 
-        # 6. 全部通过 → 真正落库（写 nodes 行，status=approved，可被 /browse、/n/{id} 读到）
-        node = Node(user_id=user.id, content=req.content, status="approved")
+        # 6. 严格校验：tags 防幻觉 + 日期合法性
+        import hashlib as _hashlib
+        from datetime import date as _date
+        # 6a. 日期合法性
+        try:
+            d1 = _date.fromisoformat(req.date_from.strip())
+            d2 = _date.fromisoformat(req.date_to.strip())
+            if d1 > d2:
+                raise HTTPException(status_code=422, detail="date_from 不能晚于 date_to")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="日期不是有效日期")
+        # 6b. tags 防幻觉：每个关键词必须出现在 标题+摘要+正文 中
+        corpus = (req.title or "") + "\n" + (req.summary or "") + "\n" + (req.content or "")
+        bad_tags = [t.strip() for t in (req.tags or "").split(",") if t.strip() and t.strip() not in corpus]
+        if bad_tags:
+            raise HTTPException(
+                status_code=422,
+                detail=f"防幻觉校验失败：以下关键词未在标题/摘要/正文中出现: {', '.join(bad_tags[:10])}"
+                      + (f"（共 {len(bad_tags)} 个）" if len(bad_tags) > 10 else ""),
+            )
+        # 6c. 全部通过 → 真正落库
+        content_hash = _hashlib.sha256(req.content.encode("utf-8")).hexdigest()
+        node = Node(
+            user_id=user.id,
+            title=req.title.strip(),
+            content=req.content,
+            content_hash=content_hash,
+            char_count=len(req.content),
+            summary=req.summary,
+            description=req.description,
+            tags=",".join(t.strip() for t in (req.tags or "").split(",") if t.strip()),
+            source_ref=req.source_ref,
+            doc_type=req.doc_type,
+            lang=req.lang,
+            author_handle=req.author_handle.strip(),
+            date_from=req.date_from.strip(),
+            date_to=req.date_to.strip(),
+            pinned=req.pinned,
+            currency=req.currency,
+            status=1,
+        )
         db.add(node)
         db.commit()
         db.refresh(node)
-        logger.info("发布信息: user_id=%s node_id=%s len=%d", user.id, node.id, len(req.content))
+        logger.info("发布信息: user_id=%s node_id=%s title=%s len=%d", user.id, node.id, node.title[:40], len(req.content))
         return NodeOut(
             id=node.id,
+            title=node.title,
             content=node.content,
             user_id=node.user_id,
-            created_at=node.created_at.isoformat(),
+            created_at=node.created_at.isoformat() if node.created_at else None,
             status=node.status,
         )
 
-    # ── 账户 ────────────────────────────────────────────────────────────
+    # ── 搜索（双路径：字面命中 + 语义扩展）────────────────────────────────
 
+    # ── web search (dual route: literal hit + semantic expansion) ─────────────────────────────────
+
+    @app.get("/api/search")
+    def search_nodes(
+        q: str = Query(..., min_length=1, max_length=100, description="搜索词；空格/逗号/、/分号 分词，多词按 mode 组合"),
+        author: str = Query("", max_length=120, description="按 author_handle 模糊过滤（空=不过滤）"),
+        mode: str = Query('and', pattern='^(and|or)$', description="多词语义: and=每词都必须命中; or=任一命中"),
+        limit: int = Query(default=20, ge=1, le=100),
+        expand: bool = Query(default=True, description="字面命中不足 5 条时是否尝试语义扩展（word_coords）"),
+        db: Session = Depends(_get_db),
+    ):
+        """倒排索引搜索（node_tags 表）+ 作者过滤，无需认证。"""
+        import math
+        from sqlalchemy import text
+
+        now = utcnow()
+        words = [w.strip() for w in re.split(r'[\s,，、;；]+', q.strip()) if w.strip()]
+        if not words:
+            words = [q.strip()]
+        multi = len(words) > 1
+
+        # ── 两阶段：先倒排表拿 id（走 PK 索引，毫秒级），再回 nodes 表 ──
+        def _tag_ids(w):
+            # 精确匹配优先（走 PK 索引，毫秒级）；无结果才 LIKE 兜底
+            r = db.execute(text("SELECT node_id FROM node_tags WHERE tag = :w"),
+                           {"w": w}).fetchall()
+            if not r:
+                r = db.execute(text("SELECT node_id FROM node_tags WHERE tag LIKE :wl"),
+                               {"wl": f"%{w}%"}).fetchall()
+            return set(x[0] for x in r)
+
+        if not multi:
+            # 纯倒排表：精确 tag 优先，无结果才 LIKE 兜底；不再全表扫 title/summary
+            tag_ids = _tag_ids(words[0])
+            ids_all = sorted(tag_ids)
+        elif mode == 'and':
+            sets = [_tag_ids(w) for w in words]
+            ids_all = sorted(set.intersection(*sets)) if sets else []
+        else:
+            sets = [_tag_ids(w) for w in words]
+            ids_all = sorted(set.union(*sets)) if sets else []
+
+        # author 过滤（走 idx_author_handle 索引）
+        if author and author.strip():
+            ar = db.execute(text("SELECT id FROM nodes WHERE author_handle LIKE :author"),
+                            {"author": f"%{author.strip()}%"}).fetchall()
+            allowed = set(x[0] for x in ar)
+            ids_all = [i for i in ids_all if i in allowed]
+
+        ids_all = ids_all[:500]
+
+        # 回 nodes 表：排序 + 限流
+        ids = []
+        if ids_all:
+            ph = ",".join(str(int(x)) for x in ids_all)
+            rows = db.execute(text(
+                f"SELECT id FROM nodes WHERE id IN ({ph}) AND deleted_at IS NULL AND status IN ('1','approved') "
+                f"ORDER BY last_hit_at DESC, created_at DESC LIMIT :lim"
+            ), {"lim": limit}).fetchall()
+            ids = [r[0] for r in rows]
+        source = "and" if (multi and mode == 'and') else ("literal" if not multi else "or")
+        expanded_words = []
+
+        if expand and len(ids) < 5:
+            wc = db.get(WordCoord, q)
+            if wc is not None:
+                all_wc = db.scalars(select(WordCoord).where(WordCoord.word != q)).all()
+                dists = []
+                for w in all_wc:
+                    d = math.sqrt((w.x - wc.x) ** 2 + (w.y - wc.y) ** 2 + (w.z - wc.z) ** 2)
+                    dists.append((w.word, d))
+                dists.sort(key=lambda x: x[1])
+                neighbors = [w for w, _ in dists[:5]]
+                expanded_words = neighbors
+                for nb in neighbors:
+                    r2 = db.execute(
+                        text("SELECT node_id FROM node_tags WHERE tag = :nb ORDER BY node_id DESC LIMIT :lim2"),
+                        {"nb": nb, "lim2": limit},
+                    ).fetchall()
+                    for r in r2:
+                        if r[0] not in ids:
+                            ids.append(r[0])
+                    if len(ids) >= limit:
+                        break
+                ids = ids[:limit]
+                source = 'expanded-' + source
+
+        nodes = []
+        if ids:
+            nodes = list(db.scalars(select(Node).where(Node.id.in_([int(x) for x in ids]))).all())
+            order_map = {int(x): k for k, x in enumerate(ids)}
+            nodes.sort(key=lambda n: order_map.get(n.id, 9999))
+        for n in nodes:
+            n.last_hit_at = now
+            n.hit_count += 1
+        db.commit()
+
+        return {
+            "query": q,
+            "author": author,
+            "words": words,
+            "mode": mode,
+            "source": source,
+            "expanded_words": expanded_words,
+            "count": len(nodes),
+            "results": [
+                {
+                    "id": n.id,
+                    "title": n.title,
+                    "summary": n.summary,
+                    "tags": n.tags or '',
+                    "user_id": n.user_id,
+                    "author_handle": n.author_handle,
+                    "date_from": n.date_from or "",
+                    "date_to": n.date_to or "",
+                    "created_at": n.created_at.isoformat() if n.created_at else None,
+                    "hit_count": n.hit_count,
+                }
+                for n in nodes
+            ],
+        }
+
+    # ── account ────────────────────────────────────────────────────
     @app.get("/api/me")
     def get_me(request: Request, db: Session = Depends(_get_db)):
         """获取当前用户信息（DRY-RUN mock：凭据为 Bearer <token>，token 直接编码 user_id）。"""
@@ -692,6 +994,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "public_key": user.public_key,
             "email_verified": user.email_verified,
             "created_at": user.created_at.isoformat(),
+        }
+
+    # ── 用户资料 ─────────────────────────────────────────────────────
+    @app.get("/api/users/{user_id}")
+    def get_user(user_id: int, request: Request, db: Session = Depends(_get_db)):
+        """按 user_id 查询用户公开资料（不含邮箱）。
+
+        需认证：必须注册过（带合法 Bearer 凭据），与发帖同等待遇。
+        返回: user_id / display_name / bio / public_key / created_at
+        """
+        # 认证校验（与发帖一致）
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <token>，需注册后查询")
+        _token_to_user(db, token)  # 非法/过期 → 401
+        user = db.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        return {
+            "user_id": user.id,
+            "display_name": user.display_name or "",
+            "bio": user.bio or "",
+            "public_key": user.public_key,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+
+    @app.post("/api/me/profile")
+    def update_me_profile(request: Request, req: UpdateProfileReq, db: Session = Depends(_get_db)):
+        """编辑自己的昵称/简介（需 Bearer 凭据）。
+
+        请求: {{"display_name": "...", "bio": "..."}}  （至少提供一项）
+        只更新提供的字段；不修改邮箱、公钥。
+        """
+        if req.display_name is None and req.bio is None:
+            raise HTTPException(status_code=422, detail="display_name / bio 至少提供一项")
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <token>")
+        if not token.startswith("mock-token-"):
+            raise HTTPException(status_code=401, detail="凭据格式应为 mock-token-<user_id>")
+        try:
+            uid = int(token[len("mock-token-"):])
+        except ValueError:
+            raise HTTPException(status_code=401, detail="凭据 user_id 非法")
+        user = db.get(User, uid)
+        if user is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        if req.display_name is not None:
+            user.display_name = req.display_name.strip()
+        if req.bio is not None:
+            user.bio = req.bio.strip()
+
+        user.updated_at = utcnow()
+        db.add(user)
+        db.commit()
+        logger.info("用户资料更新: user_id=%s", user.id)
+        return {
+            "user_id": user.id,
+            "display_name": user.display_name or "",
+            "bio": user.bio or "",
+            "updated_at": user.updated_at.isoformat() if user.updated_at else None,
         }
 
     @app.get("/api/health")
@@ -747,7 +1111,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             nodes = [
                 {"id": n.id, "created_at": n.created_at}
-                for n in db.scalars(select(Node).where(Node.status == "approved"))
+                for n in db.scalars(select(Node).where(Node.status.in_(["approved", "hit", "1"])))
             ]
         finally:
             db.close()
@@ -775,37 +1139,170 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ── SEO：单条内容的 HTML 视图（给搜索引擎用，Agent 用 /api/nodes/{id}）
     @app.get("/n/{node_id}", response_class=HTMLResponse)
     def node_html_view(node_id: int, request: Request):
-        """单条内容的 HTML 视图（最小化 SEO：title + meta + h1 + 内容）。"""
+        """单条内容的 HTML 视图：标题 + 作者 + 日期 + 摘要 + 正文。"""
+        import html as _h
         db: Session = _SFactory()
         try:
             node = db.get(Node, node_id)
         finally:
             db.close()
-        if node is None or node.status not in ("approved", "pending"):
+        if node is None or str(node.status) not in ("approved", "pending", "1"):
             raise HTTPException(status_code=404, detail="信息不存在")
 
-        # 提取第一行作为标题（假设格式是 "[桥接 #NNN]\n标题: ..." 或纯文本首行）
-        first_line = node.content.strip().split("\n")[0][:200] if node.content else f"信息 #{node_id}"
+        # 标题：优先用 title 字段，否则取正文第一行
+        title = (node.title or "").strip()
+        if not title and node.content:
+            title = node.content.strip().split("\n")[0][:120]
+        if not title:
+            title = f"信息 #{node_id}"
+
+        # 日期显示
+        date_str = ""
+        df, dt = (node.date_from or "").strip(), (node.date_to or "").strip()
+        if df and dt and df != dt:
+            date_str = f"{df} ~ {dt}"
+        elif df:
+            date_str = df
+
+        author = (node.author_handle or "").strip()
+        summary = (node.summary or "").strip()
         base = html_mod.base_url_from_request(request)
+        e = _h.escape
+
+        meta_bits = []
+        if author:
+            meta_bits.append(f'<span class="meta-author">✍ {e(author)}</span>')
+        if date_str:
+            meta_bits.append(f'<span class="meta-date">📅 {e(date_str)}</span>')
+        meta_bits.append(f'<span class="meta-id">#{node.id}</span>')
+        meta_html = " ".join(meta_bits)
+
+        summary_html = f'<p class="node-summary">{e(summary)}</p>' if summary else ""
+
+        # 文章来源（source_ref）
+        source_ref = (node.source_ref or "").strip()
+        if source_ref:
+            source_html = f'<div class="node-source"><span class="src-label">文章来源：</span><a href="{e(source_ref)}" target="_blank" rel="noopener noreferrer">{e(source_ref)}</a></div>'
+        else:
+            source_html = ""
+
+        # 关键词（该条数据的 tags）渲染在页面最后
+        tags_list = [t.strip() for t in (node.tags or "").split(",") if t.strip()]
+        if tags_list:
+            tag_spans = " ".join(f'<a class="kw" href="/search?q={e(t)}">{e(t)}</a>' for t in tags_list)
+            tags_html = f'<div class="node-tags"><span class="kw-label">关键词：</span>{tag_spans}</div>'
+        else:
+            tags_html = ""
+
+        # ── 投票统计 ──
+        votes = db.scalar(select(func.count(Vote.id)).where(Vote.node_id == node_id, Vote.vote == 1)) or 0
+        downs = db.scalar(select(func.count(Vote.id)).where(Vote.node_id == node_id, Vote.vote == -1)) or 0
+        my_vote = 0
+        token = _extract_bearer(request)
+        if token:
+            try:
+                u = _token_to_user(db, token)
+                v = db.scalars(select(Vote).where(Vote.node_id == node_id, Vote.user_id == u.id)).first()
+                my_vote = v.vote if v else 0
+            except HTTPException:
+                pass
+
+        # ── 评论列表 ──
+        comments = db.scalars(select(Comment).where(Comment.node_id == node_id).order_by(Comment.created_at.desc())).all()
+        comment_items = []
+        for c in comments:
+            comment_items.append(
+                f'<div class="comment">'
+                f'<div class="comment-meta">#{c.id} · user_{c.user_id} · {e(c.created_at.strftime("%Y-%m-%d %H:%M")) if c.created_at else ""}</div>'
+                f'<div class="comment-body">{e(c.content)}</div>'
+                f'</div>'
+            )
+        comments_html = "\n".join(comment_items) if comment_items else '<p class="no-comments">还没有评论，来抢沙发吧。</p>'
 
         html_doc = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{first_line} — SuperNode</title>
-<meta name="description" content="{node.content[:300] if node.content else 'SuperNode 信息节点'}">
+<title>{e(title)} — SuperNode</title>
+<meta name="description" content="{e(summary[:300] if summary else (node.content[:300] if node.content else 'SuperNode 信息节点'))}">
 <link rel="canonical" href="{base}/n/{node_id}">
 <style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.65; color: #1a1a1a; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; line-height: 1.7; color: #1a1a1a; background: #fafaf8; }}
 a {{ color: #0b6ec5; }}
-pre {{ background: #f0efe9; padding: 1rem; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }}
+h1 {{ font-size: 1.5rem; line-height: 1.4; margin-bottom: .5rem; }}
+.meta {{ color: #666; font-size: .85rem; margin-bottom: 1rem; }}
+.meta span {{ margin-right: 1rem; white-space: nowrap; }}
+.node-summary {{ background: #f0efe9; border-left: 3px solid #c9c6bb; padding: .8rem 1rem; font-size: .95rem; color: #444; border-radius: 0 6px 6px 0; }}
+.node-source {{ margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #e3e2dc; font-size: .9rem; }}
+.src-label {{ color: #666; margin-right: .3rem; }}
+.node-tags {{ margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #e3e2dc; font-size: .9rem; }}
+.kw {{ display: inline-block; background: #eef3f8; color: #0b6ec5; border: 1px solid #d5e2ef; border-radius: 12px; padding: .15rem .6rem; margin: .15rem .2rem 0 0; text-decoration: none; }}
+.kw:hover {{ background: #0b6ec5; color: #fff; }}
+.kw-label {{ color: #666; margin-right: .3rem; }}
+pre {{ background: #fff; border: 1px solid #e3e2dc; padding: 1.2rem; border-radius: 6px; white-space: pre-wrap; word-break: break-word; font-size: .95rem; line-height: 1.8; }}
+.vote-box {{ margin-top: 1.5rem; padding: 1rem; background: #f5f5f2; border-radius: 8px; display: flex; align-items: center; gap: 1rem; }}
+.vote-btn {{ background: #fff; border: 1px solid #d0d0c8; border-radius: 20px; padding: .4rem 1.2rem; cursor: pointer; font-size: 1rem; transition: all .15s; }}
+.vote-btn:hover {{ border-color: #0b6ec5; }}
+.vote-btn.active-up {{ background: #e8f5e9; border-color: #4caf50; color: #2e7d32; }}
+.vote-btn.active-down {{ background: #ffebee; border-color: #f44336; color: #c62828; }}
+.vote-score {{ font-size: 1.2rem; font-weight: bold; color: #333; }}
+.vote-hint {{ font-size: .8rem; color: #999; margin-left: auto; }}
+.comment-section {{ margin-top: 2rem; padding-top: 1.5rem; border-top: 2px solid #e3e2dc; }}
+.comment-section h3 {{ margin-bottom: 1rem; font-size: 1.1rem; }}
+.comment {{ padding: .8rem 0; border-bottom: 1px solid #eee; }}
+.comment-meta {{ font-size: .75rem; color: #999; margin-bottom: .3rem; }}
+.comment-body {{ font-size: .95rem; color: #333; line-height: 1.6; }}
+.no-comments {{ color: #999; font-size: .9rem; }}
+.comment-form {{ margin-top: 1rem; display: flex; gap: .5rem; }}
+.comment-form input {{ flex: 1; padding: .6rem .8rem; border: 1px solid #d0d0c8; border-radius: 6px; font-size: .9rem; }}
+.comment-form button {{ background: #0b6ec5; color: #fff; border: none; border-radius: 6px; padding: .6rem 1.2rem; cursor: pointer; font-size: .9rem; }}
+.comment-form button:hover {{ background: #095a9e; }}
 </style>
 </head>
 <body>
-<h1>{first_line}</h1>
-<pre>{node.content}</pre>
-<p><a href="{base}/">返回首页</a> · <a href="{base}/api/nodes/{node_id}">JSON 视图</a></p>
+<h1>{e(title)}</h1>
+<div class="meta">{meta_html}</div>
+{summary_html}
+<pre>{e(node.content)}</pre>
+{source_html}
+{tags_html}
+
+<div class="vote-box" id="voteBox">
+  <button class="vote-btn {'active-up' if my_vote==1 else ''}" onclick="doVote(1)">👍 赞同</button>
+  <span class="vote-score" id="voteScore">{votes - downs}</span>
+  <button class="vote-btn {'active-down' if my_vote==-1 else ''}" onclick="doVote(-1)">👎 反对</button>
+  <span class="vote-hint" id="voteHint">{'你的票：' + ('赞' if my_vote==1 else '踩' if my_vote==-1 else '未投')}</span>
+</div>
+
+<div class="comment-section">
+  <h3>💬 评论（{len(comments)}）</h3>
+  <div id="commentList">
+{comments_html}
+  </div>
+  <form class="comment-form" onsubmit="submitComment(event)">
+    <input type="text" id="commentInput" placeholder="写下你的评论..." maxlength="2000" required>
+    <button type="submit">提交</button>
+  </form>
+</div>
+
+<p><a href="{base}/">← 返回首页</a> · <a href="{base}/search">🔍 搜索</a> · <a href="{base}/api/nodes/{node_id}">JSON 视图</a></p>
+<script>
+async function doVote(v) {{
+  const r = await fetch('/api/nodes/{node_id}/vote?vote=' + v, {{headers:{{'Authorization':'Bearer ' + (localStorage.getItem('token')||'')}}}});
+  if (r.status === 401) {{ alert('请先登录（需要 Bearer token）'); return; }}
+  const d = await r.json();
+  if (d.ok) {{ location.reload(); }}
+}}
+async function submitComment(ev) {{
+  ev.preventDefault();
+  const txt = document.getElementById('commentInput').value.trim();
+  if (!txt) return;
+  const r = await fetch('/api/nodes/{node_id}/comments?content=' + encodeURIComponent(txt), {{method:'POST', headers:{{'Authorization':'Bearer ' + (localStorage.getItem('token')||'')}}}});
+  if (r.status === 401) {{ alert('请先登录（需要 Bearer token）'); return; }}
+  if (r.ok) {{ location.reload(); }} else {{ alert('评论失败'); }}
+}}
+</script>
 </body>
 </html>"""
         return HTMLResponse(html_doc)
@@ -818,12 +1315,12 @@ pre {{ background: #f0efe9; padding: 1rem; border-radius: 6px; white-space: pre-
         from sqlalchemy import func as _func
         db: Session = _SFactory()
         try:
-            total = db.scalar(select(_func.count(Node.id)).where(Node.status == "approved")) or 0
+            total = db.scalar(select(_func.count(Node.id)).where(Node.status.in_(["approved", "hit", "1"]))) or 0
             per_page = 50
             offset = (page - 1) * per_page
             rows = db.scalars(
                 select(Node)
-                .where(Node.status == "approved")
+                .where(Node.status.in_(["approved", "hit", "1"]))
                 .order_by(Node.id.desc())
                 .limit(per_page)
                 .offset(offset)
@@ -884,28 +1381,135 @@ h1 {{ font-size: 1.4rem; }} h3 {{ font-size: 1rem; margin: .3rem 0; }}
 
     # ── 人工首页 & 文档页 ──────────────────────────────────────────────
 
-    @app.get("/", response_class=HTMLResponse)
-    def home(request: Request):
-        """人工首页：最近 3 条发布 + AI 接入引导。"""
+    @app.get("/search", response_class=HTMLResponse)
+    def search_page(q: str = Query("", description="搜索关键词"),
+                    author: str = Query("", description="作者（可选）"),
+                    mode: str = Query("and", pattern="^(and|or)$"),
+                    request: Request = None):
+        """人工搜索页面。"""
+        if not q.strip():
+            return html_mod.render_search("", [], mode, [], request, author=author)
         db: Session = _SFactory()
         try:
-            nodes = [
-                {
+            import re as _re
+            from sqlalchemy import text
+            words = [w.strip() for w in _re.split(r"[\s,\uFF0C\u3001;\uFF1B]+", q.strip()) if w.strip()]
+            if not words:
+                words = [q.strip()]
+            def _tag_ids(w):
+                r = db.execute(text("SELECT node_id FROM node_tags WHERE tag = :w"),
+                               {"w": w}).fetchall()
+                if not r:
+                    r = db.execute(text("SELECT node_id FROM node_tags WHERE tag LIKE :wl"),
+                                   {"wl": f"%{w}%"}).fetchall()
+                return set(x[0] for x in r)
+            if len(words) == 1:
+                tag_ids = _tag_ids(words[0])
+                ids_all = sorted(tag_ids)
+            elif mode == "or":
+                ids_all = sorted(set.union(*[_tag_ids(w) for w in words]))
+            else:
+                sets = [_tag_ids(w) for w in words]
+                ids_all = sorted(set.intersection(*sets)) if sets else []
+            if author.strip():
+                ar = db.execute(text("SELECT id FROM nodes WHERE author_handle LIKE :author"),
+                                {"author": f"%{author.strip()}%"}).fetchall()
+                allowed = set(x[0] for x in ar)
+                ids_all = [i for i in ids_all if i in allowed]
+            ids_all = ids_all[:500]
+            ids = []
+            if ids_all:
+                ph = ",".join(str(int(x)) for x in ids_all)
+                rows = db.execute(text(
+                    f"SELECT id FROM nodes WHERE id IN ({ph}) AND deleted_at IS NULL AND status IN ('1','approved') "
+                    f"ORDER BY last_hit_at DESC, created_at DESC LIMIT 50"
+                )).fetchall()
+                ids = [r[0] for r in rows]
+            nodes = list(db.scalars(select(Node).where(Node.id.in_(ids))).all()) if ids else []
+            order_map = {int(x): k for k, x in enumerate(ids)}
+            nodes.sort(key=lambda n: order_map.get(n.id, 9999))
+            results = []
+            for n in nodes:
+                results.append({
                     "id": n.id,
-                    "content": n.content,
-                    "user_id": n.user_id,
-                    "created_at": n.created_at.isoformat(),
-                    "status": n.status,
-                }
-                for n in db.scalars(
-                    select(Node)
-                    .where(Node.status == "approved")
-                    .order_by(Node.id.desc())
-                    .limit(html_mod.HOME_RECENT_LIMIT)
-                )
-            ]
+                    "title": n.title or "(无标题)",
+                    "summary": (n.summary or "")[:200],
+                    "tags": (n.tags or "").split(","),
+                    "author_handle": n.author_handle,
+                    "date_from": n.date_from or "",
+                    "date_to": n.date_to or "",
+                })
         finally:
             db.close()
+        return html_mod.render_search(q, results, mode, words, request, author=author)
+
+    # ── 首页缓存：10 分钟 TTL，过期才查库；请求本身永远只读缓存文件 ──
+    _HOME_CACHE = "/opt/supernode/home_cache.json"
+    _HOME_TTL = 600  # 秒
+
+    def _home_cache_get():
+        """读缓存；返回 (nodes, fresh)。fresh=False 表示过期/不存在。"""
+        import os, json as _json, time as _time
+        try:
+            if os.path.exists(_HOME_CACHE):
+                age = _time.time() - os.path.getmtime(_HOME_CACHE)
+                if age < _HOME_TTL:
+                    with open(_HOME_CACHE, encoding="utf-8") as f:
+                        return _json.load(f), True
+        except Exception:
+            pass
+        return [], False
+
+    def _home_cache_refresh():
+        """查库并写缓存文件（后台/惰性触发，失败时保留旧缓存）。"""
+        import json as _json, os
+        try:
+            db: Session = _SFactory()
+            try:
+                rows = db.scalars(
+                    select(Node)
+                    .where(Node.status.in_(["approved", "hit", "1"]))
+                    .order_by(Node.pinned.desc(), Node.id.desc())
+                    .limit(html_mod.HOME_RECENT_LIMIT)
+                ).all()
+                payload = [
+                    {
+                        "id": n.id,
+                        "content": n.content[:600],
+                        "user_id": n.user_id,
+                        "created_at": n.created_at.isoformat() if n.created_at else "",
+                        "status": n.status,
+                        "pinned": n.pinned,
+                        "author_handle": n.author_handle,
+                        "title": n.title,
+                    }
+                    for n in rows
+                ]
+            finally:
+                db.close()
+            tmp = _HOME_CACHE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, _HOME_CACHE)  # 原子替换，读端永不看到半截文件
+        except Exception:
+            pass  # 查库失败：保留旧缓存继续服务
+
+    def _home_cache_ensure():
+        """缓存过期则同步刷新一次（最坏情况首页慢一次，之后 10 分钟都快）。"""
+        _, fresh = _home_cache_get()
+        if not fresh:
+            _home_cache_refresh()
+
+    @app.get("/", response_class=HTMLResponse)
+    def home(request: Request):
+        """人工首页：读缓存（10 分钟 TTL），不直接查库。"""
+        import threading
+        _home_cache_ensure()
+        nodes, fresh = _home_cache_get()
+        if not fresh:
+            # 极端情况：刷新失败且无旧缓存 —— 起后台线程再试，本次返回空列表
+            threading.Thread(target=_home_cache_refresh, daemon=True).start()
+            nodes = []
         return html_mod.render_home(nodes, request)
 
     @app.get("/en.html", response_class=PlainTextResponse)
@@ -922,6 +1526,282 @@ h1 {{ font-size: 1.4rem; }} h3 {{ font-size: 1rem; margin: .3rem 0; }}
     def api_docs(request: Request):
         """机器可读 API 文档（纯文本），从根路径迁到这里。"""
         return html_mod.API_DOCS_TEXT.format(base=html_mod.base_url_from_request(request))
+
+    @app.get("/protocol", response_class=HTMLResponse)
+    def protocol_docs(request: Request):
+        """通信协议文档（HTTP + UDP 广播）。"""
+        return html_mod.render_protocol_docs(request)
+
+
+    # ── 数据地图端点（3D点云 + 关键词检索）─────────────────────
+    @app.get('/api/map/coords')
+    def api_map_coords():
+        coords = {}
+        try:
+            with open('/opt/supernode/vps_coords.csv') as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) == 4:
+                        coords[parts[0]] = [float(parts[1]), float(parts[2]), float(parts[3])]
+        except FileNotFoundError:
+            pass
+        return {'count': len(coords), 'coords': coords}
+
+    @app.get('/api/map/search')
+    def api_map_search(q: str = '', top: int = 10, db: Session = Depends(_get_db)):
+        if top > 200: top = 200  # 本机 1GB: 安全上限
+        from sqlalchemy import or_, and_
+        words = [w.strip() for w in q.replace('，',',').replace(' ','，').split(',') if w.strip()]
+        if not words:
+            words = [q.strip()]
+        conds = [Node.tags.contains(w) for w in words]
+        rows = db.scalars(
+            select(Node).where(and_(*conds), Node.status.in_(['approved', '1'])).limit(top)
+        ).all()
+        return {'query': q, 'count': len(rows), 'results': [
+            {'id': n.id, 'title': n.title or '', 'summary': (n.summary or '')[:150],
+             'tags': n.tags or '', 'date': str(n.created_at)[:10] if n.created_at else '不详'} for n in rows]}
+
+    # ── 投票 + 评论 ─────────────────────────────────────────────
+    @app.post("/api/nodes/{node_id}/vote")
+    def vote_node(node_id: int, request: Request, vote: int = Query(..., ge=-1, le=1, description="1=赞, -1=踩, 0=撤票"), db: Session = Depends(_get_db)):
+        """投票/改票/撤票（需认证）。一人一票，重复提交覆盖。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <token>")
+        user = _token_to_user(db, token)
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        existing = db.scalars(select(Vote).where(Vote.node_id == node_id, Vote.user_id == user.id)).first()
+        if vote == 0:
+            if existing:
+                db.delete(existing)
+                db.commit()
+            return {"ok": True, "node_id": node_id, "your_vote": 0, "message": "已撤票"}
+        if existing:
+            existing.vote = vote
+            existing.created_at = utcnow()
+            db.add(existing)
+        else:
+            db.add(Vote(node_id=node_id, user_id=user.id, vote=vote))
+        db.commit()
+        return {"ok": True, "node_id": node_id, "your_vote": vote}
+
+    @app.get("/api/nodes/{node_id}/votes")
+    def get_votes(node_id: int, request: Request = None, db: Session = Depends(_get_db)):
+        """查询节点投票统计 + 当前用户自己的票（匿名可查统计）。"""
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        up = db.scalar(select(func.count(Vote.id)).where(Vote.node_id == node_id, Vote.vote == 1)) or 0
+        down = db.scalar(select(func.count(Vote.id)).where(Vote.node_id == node_id, Vote.vote == -1)) or 0
+        my_vote = 0
+        if request is not None:
+            token = _extract_bearer(request)
+            if token:
+                try:
+                    u = _token_to_user(db, token)
+                    v = db.scalars(select(Vote).where(Vote.node_id == node_id, Vote.user_id == u.id)).first()
+                    my_vote = v.vote if v else 0
+                except HTTPException:
+                    pass
+        return {"node_id": node_id, "up": up, "down": down, "score": up - down, "my_vote": my_vote}
+
+    @app.post("/api/nodes/{node_id}/comments")
+    def add_comment(node_id: int, request: Request, content: str = Query(..., min_length=1, max_length=2000), db: Session = Depends(_get_db)):
+        """发表评论（需认证）。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <token>")
+        user = _token_to_user(db, token)
+        _check_muted(user)
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        c = Comment(node_id=node_id, user_id=user.id, content=content.strip())
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"ok": True, "comment_id": c.id, "node_id": node_id, "content": c.content, "created_at": c.created_at.isoformat()}
+
+    @app.get("/api/nodes/{node_id}/comments")
+    def get_comments(node_id: int, db: Session = Depends(_get_db)):
+        """查询节点评论列表（匿名可查）。"""
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        rows = db.scalars(select(Comment).where(Comment.node_id == node_id).order_by(Comment.created_at.desc())).all()
+        return {
+            "node_id": node_id,
+            "count": len(rows),
+            "comments": [
+                {
+                    "id": c.id,
+                    "user_id": c.user_id,
+                    "content": c.content,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                }
+                for c in rows
+            ],
+        }
+
+    # ── L1 管理员接口 ───────────────────────────────────────────
+    @app.post("/api/admin/nodes/{node_id}/soft-delete")
+    def admin_soft_delete(node_id: int, request: Request, db: Session = Depends(_get_db)):
+        """软删除帖子（L1）。deleted_at 标记，可恢复。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        user = _token_to_user(db, token)
+        _require_admin(user)
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        node.deleted_at = utcnow()
+        db.add(node)
+        db.commit()
+        logger.info("软删除: node_id=%s by user=%s", node_id, user.id)
+        return {"ok": True, "node_id": node_id, "action": "soft-delete"}
+
+    @app.post("/api/admin/nodes/{node_id}/restore")
+    def admin_restore(node_id: int, request: Request, db: Session = Depends(_get_db)):
+        """恢复软删除的帖子（L1）。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        user = _token_to_user(db, token)
+        _require_admin(user)
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        node.deleted_at = None
+        db.add(node)
+        db.commit()
+        logger.info("恢复: node_id=%s by user=%s", node_id, user.id)
+        return {"ok": True, "node_id": node_id, "action": "restore"}
+
+    @app.post("/api/admin/nodes/{node_id}/hard-delete")
+    def admin_hard_delete(node_id: int, request: Request, db: Session = Depends(_get_db)):
+        """硬删除帖子（L1）。物理删除 + 连带 votes/comments，不可恢复。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        user = _token_to_user(db, token)
+        _require_admin(user)
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        # 连带删除 votes + comments
+        db.execute(delete(Vote).where(Vote.node_id == node_id))
+        db.execute(delete(Comment).where(Comment.node_id == node_id))
+        db.delete(node)
+        db.commit()
+        logger.info("硬删除: node_id=%s by user=%s", node_id, user.id)
+        return {"ok": True, "node_id": node_id, "action": "hard-delete"}
+
+    @app.post("/api/admin/users/{user_id}/mute")
+    def admin_mute(user_id: int, request: Request,
+                   hours: float = Query(default=24, gt=0, le=24*30),
+                   permanent: bool = Query(default=False),
+                   db: Session = Depends(_get_db)):
+        """禁言（L1）。?permanent=true 永久，否则 ?hours=N 临时（默认24h）。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        admin = _token_to_user(db, token)
+        _require_admin(admin)
+        target = db.get(User, user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if permanent:
+            target.muted_permanent = 1
+            target.mute_until = None
+        else:
+            from datetime import timedelta
+            target.mute_until = utcnow() + timedelta(hours=hours)
+            target.muted_permanent = 0
+        db.add(target)
+        db.commit()
+        logger.info("禁言: user_id=%s by admin=%s permanent=%s", user_id, admin.id, permanent)
+        return {"ok": True, "user_id": user_id, "muted": True,
+                "permanent": permanent,
+                "until": target.mute_until.isoformat() if target.mute_until else None}
+
+    @app.post("/api/admin/users/{user_id}/unmute")
+    def admin_unmute(user_id: int, request: Request, db: Session = Depends(_get_db)):
+        """解禁（L1）。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        admin = _token_to_user(db, token)
+        _require_admin(admin)
+        target = db.get(User, user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        target.muted_permanent = 0
+        target.mute_until = None
+        db.add(target)
+        db.commit()
+        logger.info("解禁: user_id=%s by admin=%s", user_id, admin.id)
+        return {"ok": True, "user_id": user_id, "muted": False}
+
+    @app.post("/api/admin/users/{user_id}/role")
+    def admin_set_role(user_id: int, request: Request,
+                       role: str = Query(..., pattern="^(admin|broadcaster|user)$"),
+                       db: Session = Depends(_get_db)):
+        """设置权限等级（L1）。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        admin = _token_to_user(db, token)
+        _require_admin(admin)
+        target = db.get(User, user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        target.role = role
+        db.add(target)
+        db.commit()
+        logger.info("改权限: user_id=%s role=%s by admin=%s", user_id, role, admin.id)
+        return {"ok": True, "user_id": user_id, "role": role}
+
+    @app.post("/api/admin/users/{user_id}/broadcast-level")
+    def admin_set_broadcast_level(user_id: int, request: Request,
+                                  level: int = Query(..., ge=0, le=9),
+                                  db: Session = Depends(_get_db)):
+        """设置广播等级（L1）。0-9。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        admin = _token_to_user(db, token)
+        _require_admin(admin)
+        target = db.get(User, user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        target.broadcast_level = level
+        db.add(target)
+        db.commit()
+        logger.info("改广播等级: user_id=%s level=%s by admin=%s", user_id, level, admin.id)
+        return {"ok": True, "user_id": user_id, "broadcast_level": level}
+
+    @app.post("/api/admin/nodes/{node_id}/broadcast")
+    def admin_broadcast(node_id: int, request: Request,
+                        status: str = Query(default="broadcasting", pattern="^(broadcasting|broadcast_done)$"),
+                        db: Session = Depends(_get_db)):
+        """对帖子发起/完成广播（L1）。标记 broadcast_status。"""
+        token = _extract_bearer(request)
+        if token is None:
+            raise HTTPException(status_code=401, detail="缺少凭据")
+        admin = _token_to_user(db, token)
+        _require_admin(admin)
+        node = db.get(Node, node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="节点不存在")
+        node.broadcast_status = status
+        db.add(node)
+        db.commit()
+        logger.info("广播: node_id=%s status=%s by admin=%s", node_id, status, admin.id)
+        return {"ok": True, "node_id": node_id, "broadcast_status": status}
 
     return app
 
