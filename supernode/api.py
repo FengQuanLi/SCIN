@@ -158,25 +158,29 @@ class AuthVerifyResp(BaseModel):
 
 
 class NodeCreateReq(BaseModel):
-    """发布信息请求（严格模式 v0.4）。
+    """发布信息请求（v0.5 宽松模式）。
 
-    必填：content / title / summary / tags / author_handle / date_from / date_to
+    必填：content / title
+    可选：summary / tags / author_handle / date_from / date_to（均可留空）
+    留空默认逻辑：
+      - author_handle 留空 → 发布者即作者
+      - date_from/date_to 留空 → 发布日期
     服务端额外校验：
-      - tags 每个词必须出现在 title+summary+content 中（防幻觉，违反 → 422）
-      - date_from / date_to 格式 YYYY-MM-DD，且 date_from <= date_to
+      - tags 非空时，每个词必须出现在 title+summary+content 中（防幻觉，违反 → 422）
+      - date_from / date_to 非空时格式 YYYY-MM-DD，且 date_from <= date_to
     """
     content: str = Field(..., min_length=1)
     registration_id: str = ""
     title: str = Field(..., min_length=1, max_length=120, description="标题，必填")
-    summary: str = Field(..., min_length=1, max_length=2000, description="摘要，必填")
+    summary: str = Field(default="", max_length=2000, description="摘要，可选（可留空）")
     description: str = Field(default="")
-    tags: str = Field(..., min_length=1, max_length=500, description="关键词，逗号分隔，必填；每个词必须出现在正文/标题/摘要中")
+    tags: str = Field(default="", max_length=500, description="关键词，逗号分隔，可选（可留空）；填了则每词须出现在正文/标题/摘要中")
     source_ref: str = Field(default="")
     doc_type: int = Field(default=1, ge=0, le=4)
     lang: str = Field(default="mix", pattern=r"^(zh|en|mix)$")
-    author_handle: str = Field(..., min_length=1, max_length=120, description="作者署名，必填")
-    date_from: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="文章开始日期 YYYY-MM-DD，必填")
-    date_to: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="文章结束日期 YYYY-MM-DD，必填（单日用同一日期）")
+    author_handle: str = Field(default="", max_length=120, description="作者署名，可选；留空则发布者为作者")
+    date_from: str = Field(default="", description="开始日期 YYYY-MM-DD，可选；留空则用发布日期")
+    date_to: str = Field(default="", description="结束日期 YYYY-MM-DD，可选；留空则与开始日期相同")
     pinned: int = Field(default=0, ge=0, le=1, description="1=首页置顶（可选，默认 0）")
     currency: int = Field(default=9, ge=0, le=10)
 
@@ -793,17 +797,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # 5. 空内容已由 pydantic min_length=1 拦为 422
 
-        # 6. 严格校验：tags 防幻觉 + 日期合法性
+        # 6. 校验：tags 防幻觉（非空时）+ 日期合法性（非空时）
         import hashlib as _hashlib
         from datetime import date as _date
-        # 6a. 日期合法性
+        # 6a. 日期：留空默认发布日期；只填一侧则另一侧相同
+        df = (req.date_from or "").strip()
+        dt = (req.date_to or "").strip()
+        today_iso = utcnow().date().isoformat()
+        if not df and not dt:
+            df = dt = today_iso
+        elif not df:
+            df = dt
+        elif not dt:
+            dt = df
         try:
-            d1 = _date.fromisoformat(req.date_from.strip())
-            d2 = _date.fromisoformat(req.date_to.strip())
+            d1 = _date.fromisoformat(df)
+            d2 = _date.fromisoformat(dt)
             if d1 > d2:
                 raise HTTPException(status_code=422, detail="date_from 不能晚于 date_to")
         except ValueError:
-            raise HTTPException(status_code=422, detail="日期不是有效日期")
+            raise HTTPException(status_code=422, detail="日期不是有效日期（应为 YYYY-MM-DD）")
         # 6b. tags 防幻觉：每个关键词必须出现在 标题+摘要+正文 中
         corpus = (req.title or "") + "\n" + (req.summary or "") + "\n" + (req.content or "")
         bad_tags = [t.strip() for t in (req.tags or "").split(",") if t.strip() and t.strip() not in corpus]
@@ -815,21 +828,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         # 6c. 全部通过 → 真正落库
         content_hash = _hashlib.sha256(req.content.encode("utf-8")).hexdigest()
+        # 作者留空 → 发布者即作者（昵称 → 兜底 user_id）
+        author = req.author_handle.strip()
+        if not author:
+            author = (user.display_name or "").strip() or f"user_{user.id}"
         node = Node(
             user_id=user.id,
             title=req.title.strip(),
             content=req.content,
             content_hash=content_hash,
             char_count=len(req.content),
-            summary=req.summary,
+            summary=(req.summary or "").strip(),
             description=req.description,
             tags=",".join(t.strip() for t in (req.tags or "").split(",") if t.strip()),
             source_ref=req.source_ref,
             doc_type=req.doc_type,
             lang=req.lang,
-            author_handle=req.author_handle.strip(),
-            date_from=req.date_from.strip(),
-            date_to=req.date_to.strip(),
+            author_handle=author,
+            date_from=df,
+            date_to=dt,
             pinned=req.pinned,
             currency=req.currency,
             status=1,
