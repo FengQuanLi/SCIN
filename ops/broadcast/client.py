@@ -95,18 +95,18 @@ class BroadcastClient:
                 print(f"{'='*60}\n", flush=True)
 
     def send_raw(self, obj):
-        data = json.dumps(obj).encode("utf-8")
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.transport.sendto(data)
 
     def send_encrypted(self, obj):
-        plaintext = json.dumps(obj).encode("utf-8")
+        plaintext = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         ciphertext = aes_encrypt(plaintext, self.token)
         self.transport.sendto(ciphertext)
 
     async def heartbeat_loop(self):
-        """每60秒发一次心跳。"""
+        """每15秒发一次心跳（保持 NAT 映射活跃，防止服务器主动推送被丢弃）。"""
         while self.running and self.authenticated:
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
             if self.transport and not self.transport.is_closing():
                 self.send_encrypted({"type": "hb"})
                 print(f"[{time.strftime('%H:%M:%S')}] 💓 心跳已发送")

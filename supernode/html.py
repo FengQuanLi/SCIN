@@ -898,7 +898,8 @@ SuperNode 通信协议文档 v0.1
   - 传输层: UDP（端口 9999）
   - 认证: Ed25519 公钥挑战签名
   - 加密: AES-128-CBC（认证成功后）
-  - 保活: 心跳包（客户端每 60 秒，服务器 3 分钟超时踢掉）
+  - 保活: 心跳包（客户端每 15 秒，服务器 3 分钟超时踢掉）
+  - 心跳 15 秒原因: 保持 NAT 映射活跃，否则服务器主动推送的广播包会被 NAT 丢弃
   - 广播: 服务器轮询数据库（30 秒/次），向已连接用户推送
 
 1.2 连接生命周期
@@ -914,7 +915,7 @@ SuperNode 通信协议文档 v0.1
     |                                    |
     |=== 以下全部 AES 加密 ===          |
     |                                    |
-    |--- HEARTBEAT ────────────────────→|  7. 每 60 秒一次
+    |--- HEARTBEAT ────────────────────→|  7. 每 15 秒一次
     |←── HB_ACK ────────────────────────|  8. 心跳确认
     |                                    |
     |←── BROADCAST ─────────────────────|  9. 新广播帖推送
@@ -947,7 +948,7 @@ SuperNode 通信协议文档 v0.1
 
   1.3.5 HEARTBEAT（客户端 → 服务器，AES 加密）
     {{"type": "hb"}}
-    每 60 秒发一次。
+    每 15 秒发一次（保持 NAT 映射活跃，服务器 3 分钟无心跳则踢掉）。
 
   1.3.6 HB_ACK（服务器 → 客户端，AES 加密）
     {{"type": "hb_ack"}}
@@ -964,6 +965,8 @@ SuperNode 通信协议文档 v0.1
     服务器每 30 秒扫一次数据库，
     找 broadcast_status 在 1 分钟内变为 broadcasting/broadcast_done 的帖子，
     向所有已连接且未收到过该 node_id 的用户推送。
+    注意: 整个 UDP 包必须 < MTU(1500)。广播只推送通知片段（title 80字 /
+    summary 100字 / content 150字），完整内容客户端用 node_id 走 HTTP 拉取。
 
   1.3.8 ERROR（服务器 → 客户端，明文）
     {{"type": "error", "msg": "错误描述"}}
@@ -1196,7 +1199,7 @@ class Client(asyncio.DatagramProtocol):
 
     async def heartbeat(self):
         while self.authed:
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
             self.t.sendto(aes_encrypt(b'{"type":"hb"}', self.token))
 
 async def main():

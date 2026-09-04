@@ -198,12 +198,12 @@ class BroadcastServer:
 
     def _send_raw(self, addr, obj):
         """发送明文 JSON。"""
-        data = json.dumps(obj).encode("utf-8")
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.transport.sendto(data, addr)
 
     def _send_encrypted(self, client, obj):
         """发送 AES 加密 JSON。"""
-        plaintext = json.dumps(obj).encode("utf-8")
+        plaintext = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         ciphertext = aes_encrypt(plaintext, client.token)
         self.transport.sendto(ciphertext, client.addr)
 
@@ -249,14 +249,16 @@ class BroadcastServer:
                         if not client.authenticated or client.last_broadcast_id >= node_id:
                             continue
                         client.last_broadcast_id = node_id
+                        # 注意: 整个 UDP 包必须 < MTU(1500)，否则 IP 分片在公网会被丢弃。
+                        # 广播只推送通知片段，完整内容客户端用 node_id 走 HTTP 拉取。
                         pkt = {
                             "type": "broadcast",
                             "node_id": node_id,
-                            "title": title or "",
+                            "title": (title or "")[:80],
                             "author": display_name or f"user_{client.user_id}",
                             "pubkey": u_pubkey,
-                            "summary": (summary or "")[:500],
-                            "content": (content or "")[:2000],
+                            "summary": (summary or "")[:100],
+                            "content": (content or "")[:150],
                             "status": bstatus,
                         }
                         self._send_encrypted(client, pkt)
